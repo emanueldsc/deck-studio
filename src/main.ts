@@ -605,7 +605,7 @@ app.innerHTML = `
   <section class="panel tools-panel">
     <div class="menu-shell">
       <div class="menu-top">
-        <h1 class="menu-brand">Vivid Cards</h1>
+        <h1 class="menu-brand">Deck Studio</h1>
         <p class="menu-caption">Ferramentas</p>
       </div>
 
