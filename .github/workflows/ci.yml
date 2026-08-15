@@ -61,7 +61,7 @@ jobs:
       - name: Build for GitHub Pages
         run: npm run build
         env:
-          BASE_PATH: /deck-studio/
+          BASE_PATH: /
 
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v3
