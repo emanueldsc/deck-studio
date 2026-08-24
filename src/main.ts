@@ -1,3 +1,8 @@
+import { Editor } from '@tiptap/core'
+import Color from '@tiptap/extension-color'
+import { TextStyle } from '@tiptap/extension-text-style'
+import Underline from '@tiptap/extension-underline'
+import StarterKit from '@tiptap/starter-kit'
 import {
   Canvas,
   FabricImage,
@@ -17,6 +22,31 @@ type LayerKind =
 type LayerScope = 'model' | 'deck'
 type EditMode = LayerScope
 type ImageFitMode = 'fill' | 'contain' | 'cover' | 'none' | 'scale-down'
+type TextAlignMode = 'left' | 'center' | 'right' | 'justify'
+type RichTextFormat = 'tags' | 'html'
+
+interface ShadowOverride {
+  color: string
+  blur: number
+  offsetX: number
+  offsetY: number
+}
+
+interface CardTextPropsOverride {
+  fontFamily?: string
+  fontSize?: number
+  fontWeight?: string | number
+  fontStyle?: string
+  underline?: boolean
+  linethrough?: boolean
+  overline?: boolean
+  fill?: string
+  stroke?: string
+  strokeWidth?: number
+  textAlign?: TextAlignMode
+  lineHeight?: number
+  shadow?: ShadowOverride | null
+}
 
 interface LayerMeta {
   id: string
@@ -26,10 +56,15 @@ interface LayerMeta {
   fit?: ImageFitMode
   slotWidth?: number
   slotHeight?: number
+  richTextSource?: string
+  richTextFormat?: RichTextFormat
 }
 
 interface CardModelOverride {
   text?: string
+  richText?: string
+  richTextFormat?: RichTextFormat
+  textProps?: CardTextPropsOverride
   src?: string
   fit?: ImageFitMode
 }
@@ -72,6 +107,54 @@ const FONT_OPTIONS = [
 ]
 
 const DEFAULT_DECK_NAME = 'Baralho 1'
+const SAVED_TEXT_COLORS_KEY = 'deckstudio.saved-text-styles-v2'
+const DEFAULT_SAVED_TEXT_COLORS = ['#cd7f32', '#a8a9ad', '#d4a017', '#2f9e44', '#1971c2']
+const DEFAULT_SAVED_TEXT_FOREGROUNDS = ['#ffffff', '#111111', '#111111', '#ffffff', '#ffffff']
+
+interface SavedTextStyle {
+  color: string
+  backgroundColor: string
+  borderRadius: number
+  paddingX: number
+  paddingY: number
+  fontSize: number
+}
+
+const StyledTextStyle = TextStyle.extend({
+  addAttributes() {
+    return {
+      ...this.parent?.(),
+      backgroundColor: {
+        default: null,
+        parseHTML: (element) => element.style.backgroundColor || null,
+        renderHTML: (attributes) => attributes.backgroundColor
+          ? { style: `background-color: ${attributes.backgroundColor}` }
+          : {},
+      },
+      borderRadius: {
+        default: null,
+        parseHTML: (element) => element.style.borderRadius || null,
+        renderHTML: (attributes) => attributes.borderRadius
+          ? { style: `border-radius: ${attributes.borderRadius}` }
+          : {},
+      },
+      textPadding: {
+        default: null,
+        parseHTML: (element) => element.style.padding || null,
+        renderHTML: (attributes) => attributes.textPadding
+          ? { style: `padding: ${attributes.textPadding}` }
+          : {},
+      },
+      presetFontSize: {
+        default: null,
+        parseHTML: (element) => element.style.fontSize || null,
+        renderHTML: (attributes) => attributes.presetFontSize
+          ? { style: `font-size: ${attributes.presetFontSize}` }
+          : {},
+      },
+    }
+  },
+})
 
 interface SizePreset {
   key: string
@@ -98,6 +181,24 @@ const PAPER_SIZE_PRESETS: SizePreset[] = [
   { key: 'letter', label: 'Carta (216 x 279 mm)', widthMm: 216, heightMm: 279 },
   { key: 'oficio', label: 'Oficio (216 x 330 mm)', widthMm: 216, heightMm: 330 },
 ]
+
+const NAMED_TEXT_COLORS: Record<string, string> = {
+  verde: '#2f9e44',
+  vermelho: '#d90429',
+  azul: '#1971c2',
+  amarelo: '#f08c00',
+  laranja: '#e8590c',
+  roxo: '#6f42c1',
+  rosa: '#d63384',
+  branco: '#ffffff',
+  preto: '#111111',
+  cinza: '#6c757d',
+  marrom: '#7f5539',
+  bronze: '#cd7f32',
+  cobre: '#b87333',
+  prata: '#a8a9ad',
+  dourado: '#d4a017',
+}
 
 let activeEditMode: EditMode = 'deck'
 let deckCount = 0
@@ -147,6 +248,637 @@ function isImageFitMode(value: unknown): value is ImageFitMode {
 
 function normalizeImageFit(value: unknown, fallback: ImageFitMode = 'contain'): ImageFitMode {
   return isImageFitMode(value) ? value : fallback
+}
+
+function isTextAlignMode(value: unknown): value is TextAlignMode {
+  return value === 'left' || value === 'center' || value === 'right' || value === 'justify'
+}
+
+function normalizeTextAlign(value: unknown, fallback: TextAlignMode = 'left'): TextAlignMode {
+  return isTextAlignMode(value) ? value : fallback
+}
+
+function extractShadowOverride(value: unknown): ShadowOverride | null | undefined {
+  if (value == null) {
+    return null
+  }
+
+  if (typeof value !== 'object') {
+    return undefined
+  }
+
+  const candidate = value as Record<string, unknown>
+  const color = typeof candidate['color'] === 'string' ? candidate['color'] : '#000000'
+  const blur = typeof candidate['blur'] === 'number' ? candidate['blur'] : 0
+  const offsetX = typeof candidate['offsetX'] === 'number' ? candidate['offsetX'] : 2
+  const offsetY = typeof candidate['offsetY'] === 'number' ? candidate['offsetY'] : 2
+
+  return {
+    color,
+    blur,
+    offsetX,
+    offsetY,
+  }
+}
+
+function readTextPropsFromSerialized(record: Record<string, unknown>): CardTextPropsOverride {
+  const output: CardTextPropsOverride = {}
+
+  if (typeof record['fontFamily'] === 'string') output.fontFamily = record['fontFamily']
+  if (typeof record['fontSize'] === 'number') output.fontSize = record['fontSize']
+  if (typeof record['fontWeight'] === 'string' || typeof record['fontWeight'] === 'number') {
+    output.fontWeight = record['fontWeight']
+  }
+  if (typeof record['fontStyle'] === 'string') output.fontStyle = record['fontStyle']
+  if (typeof record['underline'] === 'boolean') output.underline = record['underline']
+  if (typeof record['linethrough'] === 'boolean') output.linethrough = record['linethrough']
+  if (typeof record['overline'] === 'boolean') output.overline = record['overline']
+  if (typeof record['fill'] === 'string') output.fill = record['fill']
+  if (typeof record['stroke'] === 'string') output.stroke = record['stroke']
+  if (typeof record['strokeWidth'] === 'number') output.strokeWidth = record['strokeWidth']
+  if (isTextAlignMode(record['textAlign'])) output.textAlign = record['textAlign']
+  if (typeof record['lineHeight'] === 'number') output.lineHeight = record['lineHeight']
+
+  const shadow = extractShadowOverride(record['shadow'])
+  if (shadow !== undefined) {
+    output.shadow = shadow
+  }
+
+  return output
+}
+
+function diffCardTextProps(
+  current: Record<string, unknown>,
+  base: Record<string, unknown>,
+): CardTextPropsOverride | undefined {
+  const currentProps = readTextPropsFromSerialized(current)
+  const baseProps = readTextPropsFromSerialized(base)
+  const diff: CardTextPropsOverride = {}
+
+  const keys: Array<keyof CardTextPropsOverride> = [
+    'fontFamily',
+    'fontSize',
+    'fontWeight',
+    'fontStyle',
+    'underline',
+    'linethrough',
+    'overline',
+    'fill',
+    'stroke',
+    'strokeWidth',
+    'textAlign',
+    'lineHeight',
+    'shadow',
+  ]
+
+  keys.forEach((key) => {
+    const currentValue = currentProps[key]
+    const baseValue = baseProps[key]
+    if (JSON.stringify(currentValue) !== JSON.stringify(baseValue)) {
+      ;(diff as Record<string, unknown>)[key] = currentValue
+    }
+  })
+
+  return Object.keys(diff).length > 0 ? diff : undefined
+}
+
+function resolveTextColorTag(rawTag: string): string | null {
+  const tag = rawTag.trim().toLowerCase()
+  if (!tag) return null
+
+  if (NAMED_TEXT_COLORS[tag]) {
+    return NAMED_TEXT_COLORS[tag]
+  }
+
+  if (/^#[0-9a-f]{6}$/i.test(tag)) {
+    return tag
+  }
+
+  if (/^[0-9a-f]{6}$/i.test(tag)) {
+    return `#${tag}`
+  }
+
+  return null
+}
+
+function parseSquareTagToken(token: string):
+  | { valid: false }
+  | { valid: true; isClosing: boolean; name: string; value?: string } {
+  const inner = token.slice(1, -1).trim()
+  if (!inner) return { valid: false }
+
+  const isClosing = inner.startsWith('/')
+  const payload = isClosing ? inner.slice(1).trim() : inner
+  if (!payload) return { valid: false }
+
+  const equalIndex = payload.indexOf('=')
+  if (equalIndex < 0) {
+    return {
+      valid: true,
+      isClosing,
+      name: payload.toLowerCase(),
+    }
+  }
+
+  return {
+    valid: true,
+    isClosing,
+    name: payload.slice(0, equalIndex).trim().toLowerCase(),
+    value: payload.slice(equalIndex + 1).trim(),
+  }
+}
+
+function parseTaggedText(
+  markup: string,
+  fallbackColor: string,
+): { text: string; styles: Record<number, Record<number, { fill: string }>> } {
+  const styles: Record<number, Record<number, { fill: string }>> = {}
+  const colorStack: string[] = []
+  const tagRegex = /<\/?[^>]+>|\[(?:\/)?[^\]]+\]/g
+  let output = ''
+  let lastIndex = 0
+  let lineIndex = 0
+  let charIndex = 0
+
+  const appendChunk = (chunk: string): void => {
+    const activeColor = colorStack[colorStack.length - 1]
+    for (const char of chunk) {
+      output += char
+      if (char === '\n') {
+        lineIndex += 1
+        charIndex = 0
+        continue
+      }
+
+      if (activeColor && activeColor.toLowerCase() !== fallbackColor.toLowerCase()) {
+        styles[lineIndex] ??= {}
+        styles[lineIndex][charIndex] = { fill: activeColor }
+      }
+
+      charIndex += 1
+    }
+  }
+
+  let match: RegExpExecArray | null = tagRegex.exec(markup)
+  while (match) {
+    appendChunk(markup.slice(lastIndex, match.index))
+
+    const fullTag = match[0]
+    if (fullTag.startsWith('<')) {
+      const tagName = fullTag.replace(/^<\/?/, '').replace(/>$/, '').trim()
+      const isClosing = fullTag.startsWith('</')
+      const resolvedColor = resolveTextColorTag(tagName)
+
+      if (!resolvedColor) {
+        appendChunk(fullTag)
+      } else if (isClosing) {
+        const index = colorStack.lastIndexOf(resolvedColor)
+        if (index >= 0) {
+          colorStack.splice(index, 1)
+        }
+      } else {
+        colorStack.push(resolvedColor)
+      }
+    } else {
+      const parsedSquare = parseSquareTagToken(fullTag)
+      if (!parsedSquare.valid) {
+        appendChunk(fullTag)
+      } else if (parsedSquare.isClosing) {
+        if (parsedSquare.name === 'cor' || parsedSquare.name === 'color') {
+          colorStack.pop()
+        } else {
+          const resolvedColor = resolveTextColorTag(parsedSquare.name)
+          if (!resolvedColor) {
+            appendChunk(fullTag)
+          } else {
+            const index = colorStack.lastIndexOf(resolvedColor)
+            if (index >= 0) {
+              colorStack.splice(index, 1)
+            }
+          }
+        }
+      } else {
+        const fromPair =
+          (parsedSquare.name === 'cor' || parsedSquare.name === 'color') && parsedSquare.value
+            ? resolveTextColorTag(parsedSquare.value)
+            : null
+        const fromSingle = fromPair ? null : resolveTextColorTag(parsedSquare.name)
+        const resolvedColor = fromPair ?? fromSingle
+
+        if (!resolvedColor) {
+          appendChunk(fullTag)
+        } else {
+          colorStack.push(resolvedColor)
+        }
+      }
+    }
+
+    lastIndex = tagRegex.lastIndex
+    match = tagRegex.exec(markup)
+  }
+
+  appendChunk(markup.slice(lastIndex))
+
+  return {
+    text: output,
+    styles,
+  }
+}
+
+function applyTaggedTextToObject(textObject: FabricText | Textbox, markup: string): void {
+  const fallbackFill = toHexColor(String((textObject as { fill?: unknown }).fill ?? '#1c2738'), '#1c2738')
+  const parsed = parseTaggedText(markup, fallbackFill)
+
+  textObject.set({
+    text: parsed.text,
+    styles: parsed.styles,
+  })
+
+  const meta = getLayerMeta(textObject)
+  setLayerMeta(textObject, {
+    ...meta,
+    richTextSource: markup,
+    richTextFormat: 'tags',
+  })
+  textObject.setCoords()
+}
+
+function parseHtmlRichText(
+  html: string,
+  fallbackColor: string,
+): {
+  text: string
+  styles: Record<number, Record<number, { fill?: string; textBackgroundColor?: string; textBackgroundRadius?: number; textBackgroundPaddingX?: number; textBackgroundPaddingY?: number; fontSize?: number; fontWeight?: string; fontStyle?: string; underline?: boolean }>>
+} {
+  const parser = new DOMParser()
+  const doc = parser.parseFromString(`<div>${html}</div>`, 'text/html')
+  const root = doc.body.firstElementChild
+  const styles: Record<number, Record<number, { fill?: string; textBackgroundColor?: string; textBackgroundRadius?: number; textBackgroundPaddingX?: number; textBackgroundPaddingY?: number; fontSize?: number; fontWeight?: string; fontStyle?: string; underline?: boolean }>> = {}
+
+  if (!root) {
+    return { text: '', styles }
+  }
+
+  let output = ''
+  let lineIndex = 0
+  let charIndex = 0
+
+  const appendText = (
+    chunk: string,
+    style: { fill?: string; textBackgroundColor?: string; textBackgroundRadius?: number; textBackgroundPaddingX?: number; textBackgroundPaddingY?: number; fontSize?: number; fontWeight?: string; fontStyle?: string; underline?: boolean },
+  ): void => {
+    for (const char of chunk) {
+      output += char
+      if (char === '\n') {
+        lineIndex += 1
+        charIndex = 0
+        continue
+      }
+
+      const hasStyle = Boolean(style.fill || style.textBackgroundColor || style.textBackgroundRadius || style.textBackgroundPaddingX || style.textBackgroundPaddingY || style.fontSize || style.fontWeight || style.fontStyle || style.underline)
+      if (hasStyle) {
+        styles[lineIndex] ??= {}
+        styles[lineIndex][charIndex] = {
+          ...(style.fill ? { fill: style.fill } : {}),
+          ...(style.textBackgroundColor ? { textBackgroundColor: style.textBackgroundColor } : {}),
+          ...(style.textBackgroundRadius ? { textBackgroundRadius: style.textBackgroundRadius } : {}),
+          ...(style.textBackgroundPaddingX ? { textBackgroundPaddingX: style.textBackgroundPaddingX } : {}),
+          ...(style.textBackgroundPaddingY ? { textBackgroundPaddingY: style.textBackgroundPaddingY } : {}),
+          ...(style.fontSize ? { fontSize: style.fontSize } : {}),
+          ...(style.fontWeight ? { fontWeight: style.fontWeight } : {}),
+          ...(style.fontStyle ? { fontStyle: style.fontStyle } : {}),
+          ...(style.underline ? { underline: true } : {}),
+        }
+      }
+
+      charIndex += 1
+    }
+  }
+
+  const walk = (
+    node: Node,
+    inherited: { fill?: string; textBackgroundColor?: string; textBackgroundRadius?: number; textBackgroundPaddingX?: number; textBackgroundPaddingY?: number; fontSize?: number; fontWeight?: string; fontStyle?: string; underline?: boolean },
+  ): void => {
+    if (node.nodeType === Node.TEXT_NODE) {
+      appendText(node.textContent ?? '', inherited)
+      return
+    }
+
+    if (!(node instanceof HTMLElement)) {
+      return
+    }
+
+    if (node.tagName === 'BR') {
+      appendText('\n', inherited)
+      return
+    }
+
+    const style = { ...inherited }
+    const tag = node.tagName.toLowerCase()
+
+    if (tag === 'strong' || tag === 'b') style.fontWeight = 'bold'
+    if (tag === 'em' || tag === 'i') style.fontStyle = 'italic'
+    if (tag === 'u') style.underline = true
+
+    const inlineColor = node.style.color
+    const inlineBackgroundColor = node.style.backgroundColor
+    const inlineBorderRadius = Number.parseFloat(node.style.borderRadius)
+    const paddingParts = node.style.padding.split(/\s+/).filter(Boolean).map(Number.parseFloat)
+    const inlinePaddingY = paddingParts[0]
+    const inlinePaddingX = paddingParts[1] ?? paddingParts[0]
+    const inlineFontSize = Number.parseFloat(node.style.fontSize)
+    const inlineWeight = node.style.fontWeight
+    const inlineStyle = node.style.fontStyle
+    const textDecoration = node.style.textDecoration
+
+    if (inlineColor) style.fill = inlineColor
+    if (inlineBackgroundColor) style.textBackgroundColor = inlineBackgroundColor
+    if (Number.isFinite(inlineBorderRadius)) style.textBackgroundRadius = Math.max(0, inlineBorderRadius)
+    if (Number.isFinite(inlinePaddingX)) style.textBackgroundPaddingX = Math.max(0, inlinePaddingX)
+    if (Number.isFinite(inlinePaddingY)) style.textBackgroundPaddingY = Math.max(0, inlinePaddingY)
+    if (Number.isFinite(inlineFontSize)) style.fontSize = Math.max(1, inlineFontSize)
+    if (inlineWeight) style.fontWeight = inlineWeight
+    if (inlineStyle) style.fontStyle = inlineStyle
+    if (textDecoration.includes('underline')) style.underline = true
+
+    const hasBlockBreak = tag === 'p' || tag === 'div'
+    if (hasBlockBreak && output.length > 0 && !output.endsWith('\n')) {
+      appendText('\n', inherited)
+    }
+
+    Array.from(node.childNodes).forEach((child) => {
+      walk(child, style)
+    })
+  }
+
+  Array.from(root.childNodes).forEach((child) => {
+    walk(child, { fill: fallbackColor })
+  })
+
+  const normalized = output.replace(/\n{3,}/g, '\n\n').replace(/^\n+/, '').replace(/\n+$/, '')
+  if (normalized !== output) {
+    // Re-run parser quickly with normalized text only; styles remain acceptable for current use.
+    output = normalized
+  }
+
+  return { text: output, styles }
+}
+
+function applyRichTextToObject(
+  textObject: FabricText | Textbox,
+  richText: string,
+  format: RichTextFormat,
+): void {
+  const fallbackFill = toHexColor(String((textObject as { fill?: unknown }).fill ?? '#1c2738'), '#1c2738')
+  const parsed = format === 'html'
+    ? parseHtmlRichText(richText, fallbackFill)
+    : parseTaggedText(richText, fallbackFill)
+
+  textObject.set({ text: parsed.text, styles: parsed.styles })
+  const meta = getLayerMeta(textObject)
+  setLayerMeta(textObject, {
+    ...meta,
+    richTextSource: richText,
+    richTextFormat: format,
+  })
+  textObject.setCoords()
+}
+
+function installRoundedTextBackgroundRenderer(): void {
+  const prototype = FabricText.prototype as unknown as Record<string, unknown>
+  const originalRenderer = prototype['_renderTextLinesBackground'] as ((ctx: CanvasRenderingContext2D) => void) | undefined
+  if (!originalRenderer || prototype['_roundedTextBackgroundInstalled']) return
+
+  prototype['_roundedTextBackgroundInstalled'] = true
+  prototype['_renderTextLinesBackground'] = function (this: any, ctx: CanvasRenderingContext2D) {
+    if (this.path || (!this.textBackgroundColor && !this.styleHas('textBackgroundColor'))) {
+      originalRenderer.call(this, ctx)
+      return
+    }
+
+    const originalFill = ctx.fillStyle
+    const leftOffset = this._getLeftOffset()
+    let lineTopOffset = this._getTopOffset()
+    const drawRun = (x: number, y: number, width: number, height: number, color: string, radius: number, paddingX: number, paddingY: number) => {
+      if (!color || width <= 0) return
+      ctx.fillStyle = color
+      x -= paddingX
+      y -= paddingY
+      width += paddingX * 2
+      height += paddingY * 2
+      const safeRadius = Math.min(Math.max(0, radius), width / 2, height / 2)
+      ctx.beginPath()
+      if (typeof ctx.roundRect === 'function') {
+        ctx.roundRect(x, y, width, height, safeRadius)
+      } else {
+        ctx.rect(x, y, width, height)
+      }
+      ctx.fill()
+    }
+
+    for (let lineIndex = 0; lineIndex < this._textLines.length; lineIndex += 1) {
+      const lineHeight = this.getHeightOfLine(lineIndex)
+      if (!this.textBackgroundColor && !this.styleHas('textBackgroundColor', lineIndex)) {
+        lineTopOffset += lineHeight
+        continue
+      }
+      const line = this._textLines[lineIndex]
+      const lineLeftOffset = this._getLineLeftOffset(lineIndex)
+      const backgroundHeight = this.getHeightOfLineImpl(lineIndex)
+      let runStart = 0
+      let runWidth = 0
+      let runColor = this.getValueOfPropertyAt(lineIndex, 0, 'textBackgroundColor') as string
+      let runRadius = Number(this.getValueOfPropertyAt(lineIndex, 0, 'textBackgroundRadius')) || 0
+      let runPaddingX = Number(this.getValueOfPropertyAt(lineIndex, 0, 'textBackgroundPaddingX')) || 0
+      let runPaddingY = Number(this.getValueOfPropertyAt(lineIndex, 0, 'textBackgroundPaddingY')) || 0
+
+      for (let charIndex = 0; charIndex < line.length; charIndex += 1) {
+        const bounds = this.__charBounds[lineIndex][charIndex]
+        const color = this.getValueOfPropertyAt(lineIndex, charIndex, 'textBackgroundColor') as string
+        const radius = Number(this.getValueOfPropertyAt(lineIndex, charIndex, 'textBackgroundRadius')) || 0
+        const paddingX = Number(this.getValueOfPropertyAt(lineIndex, charIndex, 'textBackgroundPaddingX')) || 0
+        const paddingY = Number(this.getValueOfPropertyAt(lineIndex, charIndex, 'textBackgroundPaddingY')) || 0
+        if (color !== runColor || radius !== runRadius || paddingX !== runPaddingX || paddingY !== runPaddingY) {
+          let x = leftOffset + lineLeftOffset + runStart
+          if (this.direction === 'rtl') x = this.width - x - runWidth
+          drawRun(x, lineTopOffset, runWidth, backgroundHeight, runColor, runRadius, runPaddingX, runPaddingY)
+          runStart = bounds.left
+          runWidth = bounds.width
+          runColor = color
+          runRadius = radius
+          runPaddingX = paddingX
+          runPaddingY = paddingY
+        } else {
+          runWidth += bounds.kernedWidth
+        }
+      }
+      let x = leftOffset + lineLeftOffset + runStart
+      if (this.direction === 'rtl') x = this.width - x - runWidth
+      drawRun(x, lineTopOffset, runWidth, backgroundHeight, runColor, runRadius, runPaddingX, runPaddingY)
+      lineTopOffset += lineHeight
+    }
+    ctx.fillStyle = originalFill
+  }
+}
+
+installRoundedTextBackgroundRenderer()
+
+function wrapSelectionWithTag(textarea: HTMLTextAreaElement, tag: string): void {
+  const start = textarea.selectionStart ?? 0
+  const end = textarea.selectionEnd ?? start
+  const before = textarea.value.slice(0, start)
+  const selected = textarea.value.slice(start, end)
+  const after = textarea.value.slice(end)
+  const openTag = `<${tag}>`
+  const closeTag = `</${tag}>`
+
+  textarea.value = `${before}${openTag}${selected}${closeTag}${after}`
+  textarea.focus()
+  textarea.setSelectionRange(start + openTag.length, start + openTag.length + selected.length)
+  textarea.dispatchEvent(new Event('input', { bubbles: true }))
+}
+
+function wrapSelectionWithColor(textarea: HTMLTextAreaElement, colorToken: string, syntax: 'html' | 'bbcode'): void {
+  if (syntax === 'bbcode') {
+    const start = textarea.selectionStart ?? 0
+    const end = textarea.selectionEnd ?? start
+    const before = textarea.value.slice(0, start)
+    const selected = textarea.value.slice(start, end)
+    const after = textarea.value.slice(end)
+    const openTag = `[cor=${colorToken}]`
+    const closeTag = `[/cor]`
+
+    textarea.value = `${before}${openTag}${selected}${closeTag}${after}`
+    textarea.focus()
+    textarea.setSelectionRange(start + openTag.length, start + openTag.length + selected.length)
+    textarea.dispatchEvent(new Event('input', { bubbles: true }))
+    return
+  }
+
+  wrapSelectionWithTag(textarea, colorToken)
+}
+
+function loadSavedTextColors(): SavedTextStyle[] {
+  try {
+    const saved = JSON.parse(localStorage.getItem(SAVED_TEXT_COLORS_KEY) ?? '[]')
+    if (Array.isArray(saved)) {
+      return DEFAULT_SAVED_TEXT_COLORS.map((fallback, index) => {
+        const item = saved[index]
+        if (typeof item === 'string') {
+          return { color: DEFAULT_SAVED_TEXT_FOREGROUNDS[index], backgroundColor: item, borderRadius: 6, paddingX: 2, paddingY: 2, fontSize: 40 }
+        }
+        return {
+          color: typeof item?.color === 'string' ? item.color : DEFAULT_SAVED_TEXT_FOREGROUNDS[index],
+          backgroundColor: typeof item?.backgroundColor === 'string' ? item.backgroundColor : fallback,
+          borderRadius: typeof item?.borderRadius === 'number' ? clamp(0, 24, item.borderRadius) : 6,
+          paddingX: typeof item?.paddingX === 'number'
+            ? clamp(0, 20, item.paddingX)
+            : typeof item?.padding === 'number' ? clamp(0, 20, item.padding) : 2,
+          paddingY: typeof item?.paddingY === 'number'
+            ? clamp(0, 20, item.paddingY)
+            : typeof item?.padding === 'number' ? clamp(0, 20, item.padding) : 2,
+          fontSize: typeof item?.fontSize === 'number' ? clamp(8, 220, item.fontSize) : 40,
+        }
+      })
+    }
+  } catch {
+    // Use defaults if browser storage is unavailable or contains invalid data.
+  }
+  return DEFAULT_SAVED_TEXT_COLORS.map((backgroundColor, index) => ({
+    color: DEFAULT_SAVED_TEXT_FOREGROUNDS[index],
+    backgroundColor,
+    borderRadius: 6,
+    paddingX: 2,
+    paddingY: 2,
+    fontSize: 40,
+  }))
+}
+
+function saveTextColors(colors: SavedTextStyle[]): void {
+  try {
+    localStorage.setItem(SAVED_TEXT_COLORS_KEY, JSON.stringify(colors))
+  } catch {
+    // The palette still works for this session when storage is unavailable.
+  }
+}
+
+function createSavedTextColorPalette(onApply: (style: SavedTextStyle) => void): HTMLDivElement {
+  const styles = loadSavedTextColors()
+  const palette = document.createElement('div')
+  palette.className = 'saved-color-palette'
+
+  styles.forEach((savedStyle, index) => {
+    const slot = document.createElement('div')
+    slot.className = 'saved-color-slot'
+    const picker = document.createElement('input')
+    picker.type = 'color'
+    picker.value = savedStyle.color
+    picker.title = `Cor do texto ${index + 1}`
+    attachNoDragPropagation(picker)
+    const backgroundPicker = document.createElement('input')
+    backgroundPicker.type = 'color'
+    backgroundPicker.value = savedStyle.backgroundColor
+    backgroundPicker.title = `Cor de fundo ${index + 1}`
+    attachNoDragPropagation(backgroundPicker)
+    const radiusPicker = document.createElement('input')
+    radiusPicker.type = 'number'
+    radiusPicker.min = '0'
+    radiusPicker.max = '24'
+    radiusPicker.value = String(savedStyle.borderRadius)
+    radiusPicker.title = `Arredondamento ${index + 1}`
+    attachNoDragPropagation(radiusPicker)
+    const paddingXPicker = document.createElement('input')
+    paddingXPicker.type = 'number'
+    paddingXPicker.min = '0'
+    paddingXPicker.max = '20'
+    paddingXPicker.value = String(savedStyle.paddingX)
+    paddingXPicker.title = `Padding X ${index + 1}`
+    attachNoDragPropagation(paddingXPicker)
+    const paddingYPicker = document.createElement('input')
+    paddingYPicker.type = 'number'
+    paddingYPicker.min = '0'
+    paddingYPicker.max = '20'
+    paddingYPicker.value = String(savedStyle.paddingY)
+    paddingYPicker.title = `Padding Y ${index + 1}`
+    attachNoDragPropagation(paddingYPicker)
+    const fontSizePicker = document.createElement('input')
+    fontSizePicker.type = 'number'
+    fontSizePicker.min = '8'
+    fontSizePicker.max = '220'
+    fontSizePicker.value = String(savedStyle.fontSize)
+    fontSizePicker.title = `Tamanho da fonte ${index + 1}`
+    attachNoDragPropagation(fontSizePicker)
+    const applyButton = document.createElement('button')
+    applyButton.type = 'button'
+    applyButton.className = 'saved-color-apply'
+    applyButton.textContent = `Aa ${index + 1}`
+    applyButton.title = `Aplicar cor padrão ${index + 1}`
+    const updatePreset = () => {
+      savedStyle.color = picker.value
+      savedStyle.backgroundColor = backgroundPicker.value
+      savedStyle.borderRadius = clamp(0, 24, Number(radiusPicker.value) || 0)
+      savedStyle.paddingX = clamp(0, 20, Number(paddingXPicker.value) || 0)
+      savedStyle.paddingY = clamp(0, 20, Number(paddingYPicker.value) || 0)
+      savedStyle.fontSize = clamp(8, 220, Number(fontSizePicker.value) || 40)
+      applyButton.style.color = savedStyle.color
+      applyButton.style.background = savedStyle.backgroundColor
+      applyButton.style.borderRadius = `${savedStyle.borderRadius}px`
+      applyButton.style.padding = `${savedStyle.paddingY}px ${savedStyle.paddingX}px`
+      applyButton.style.fontSize = `${Math.min(24, Math.max(10, savedStyle.fontSize / 2))}px`
+      saveTextColors(styles)
+    }
+    applyButton.addEventListener('click', () => onApply({ ...savedStyle }))
+    picker.addEventListener('input', updatePreset)
+    backgroundPicker.addEventListener('input', updatePreset)
+    radiusPicker.addEventListener('input', updatePreset)
+    paddingXPicker.addEventListener('input', updatePreset)
+    paddingYPicker.addEventListener('input', updatePreset)
+    fontSizePicker.addEventListener('input', updatePreset)
+    updatePreset()
+    slot.append(picker, backgroundPicker, radiusPicker, paddingXPicker, paddingYPicker, fontSizePicker, applyButton)
+    palette.append(slot)
+  })
+  return palette
 }
 
 function sourceObjectBox(object: FabricObject): { width: number; height: number } {
@@ -298,8 +1030,30 @@ function collectCardModelOverrides(
     if (kind === 'text') {
       const currentText = String(current['text'] ?? '')
       const baseText = String(base['text'] ?? '')
-      if (currentText !== baseText) {
-        overrides[id] = { text: currentText }
+      const currentData = current['data'] as Partial<LayerMeta> | undefined
+      const baseData = base['data'] as Partial<LayerMeta> | undefined
+      const currentRichText = typeof currentData?.richTextSource === 'string' ? currentData.richTextSource : ''
+      const baseRichText = typeof baseData?.richTextSource === 'string' ? baseData.richTextSource : ''
+      const currentRichTextFormat: RichTextFormat = currentData?.richTextFormat === 'html' ? 'html' : 'tags'
+      const baseRichTextFormat: RichTextFormat = baseData?.richTextFormat === 'html' ? 'html' : 'tags'
+
+      const textProps = diffCardTextProps(current, base)
+
+      if (currentRichText && (currentRichText !== baseRichText || currentRichTextFormat !== baseRichTextFormat)) {
+        overrides[id] = {
+          richText: currentRichText,
+          richTextFormat: currentRichTextFormat,
+          text: currentText,
+          ...(textProps ? { textProps } : {}),
+        }
+        continue
+      }
+
+      if (currentText !== baseText || textProps) {
+        overrides[id] = {
+          ...(currentText !== baseText ? { text: currentText } : {}),
+          ...(textProps ? { textProps } : {}),
+        }
       }
       continue
     }
@@ -424,7 +1178,30 @@ function buildCardCanvasState(deck: DeckDocument, cardId: string): ReturnType<Ca
     if (!id) continue
     const override = card?.modelOverrides?.[id]
     if (!override) continue
-    if (typeof override.text === 'string') object['text'] = override.text
+    const objectData = object['data'] as Partial<LayerMeta> | undefined
+    const kind = objectData?.kind
+
+    if (kind === 'text') {
+      if (typeof override.richText === 'string' && override.richText.length > 0) {
+        const format: RichTextFormat = override.richTextFormat === 'html' ? 'html' : 'tags'
+        const fallbackFill = toHexColor(typeof object['fill'] === 'string' ? object['fill'] : '#1c2738', '#1c2738')
+        const parsed = format === 'html'
+          ? parseHtmlRichText(override.richText, fallbackFill)
+          : parseTaggedText(override.richText, fallbackFill)
+        object['text'] = parsed.text
+        object['styles'] = parsed.styles
+      } else if (typeof override.text === 'string') {
+        object['text'] = override.text
+      }
+
+      if (override.textProps) {
+        const changed = override.textProps as Record<string, unknown>
+        Object.keys(changed).forEach((key) => {
+          object[key] = changed[key]
+        })
+      }
+    }
+
     if (typeof override.src === 'string' && override.src && override.src !== object['src']) {
       // Changing src: remove stale dimensions so Fabric.js uses the new image's natural size
       delete object['width']
@@ -435,13 +1212,25 @@ function buildCardCanvasState(deck: DeckDocument, cardId: string): ReturnType<Ca
     }
     const overrideFit = override.fit ?? layerFitFromSerialized(object)
     const existingData = object['data'] as Record<string, unknown> | undefined
-    object['data'] = {
+    const mergedData: Record<string, unknown> = {
       ...existingData,
       ...(overrideFit ? { fit: overrideFit } : {}),
       // preserve slot dimensions so loadDeckCanvas can reapply fit without recalculating
       ...(existingData?.['slotWidth'] != null ? { slotWidth: existingData['slotWidth'] } : {}),
       ...(existingData?.['slotHeight'] != null ? { slotHeight: existingData['slotHeight'] } : {}),
     }
+
+    if (kind === 'text') {
+      if (typeof override.richText === 'string' && override.richText.length > 0) {
+        mergedData['richTextSource'] = override.richText
+        mergedData['richTextFormat'] = override.richTextFormat === 'html' ? 'html' : 'tags'
+      } else {
+        delete mergedData['richTextSource']
+        delete mergedData['richTextFormat']
+      }
+    }
+
+    object['data'] = mergedData
   }
 
   return {
@@ -463,6 +1252,8 @@ async function switchToModelView(): Promise<void> {
   if (activeEditMode === 'model') return
   persistActiveDeckDocument() // activeEditMode is 'deck' here → saves both model and card
   activeEditMode = 'model'
+  activeRightPanelTab = 'model-layers'
+  destroySelectedTextEditor()
   const deck = currentDeck()
   canvas.clear()
   layerById.clear()
@@ -484,6 +1275,7 @@ async function switchToCardView(): Promise<void> {
   if (activeEditMode === 'deck') return
   persistActiveDeckDocument() // activeEditMode is 'model' here → saves only modelCanvas
   activeEditMode = 'deck'
+  activeRightPanelTab = 'cards'
   await loadActiveDeckCard(currentDeck())
   await refreshDeckThumbnails(currentDeck())
   renderWorkspaceTabs()
@@ -650,6 +1442,7 @@ app.innerHTML = `
   <div class="right-panel-host">
     <div class="right-panel-tab-bar">
       <button id="editDeckButton" class="tab-button is-active" type="button">Baralho</button>
+      <button id="editSelectionButton" class="tab-button" type="button" hidden>Edição</button>
       <button id="editModelButton" class="tab-button" type="button">Modelo</button>
     </div>
     <section id="cardsSection" class="panel cards-panel">
@@ -657,6 +1450,11 @@ app.innerHTML = `
       <p class="subtitle compact" id="cardCountLabel"></p>
       <div id="cardThumbnails" class="card-thumbnails"></div>
       <button id="addCardButton" class="primary" type="button">+ Adicionar carta</button>
+    </section>
+    <section id="editSection" class="panel edit-panel" hidden>
+      <h2>Edição</h2>
+      <p class="subtitle compact" id="editItemLabel">Selecione um item da carta para editar.</p>
+      <div id="editPanelContent" class="edit-panel-content"></div>
     </section>
     <section id="layersSection" class="panel layers-panel" hidden>
       <h2>Layers</h2>
@@ -775,6 +1573,7 @@ const importDeckButton = requireElement<HTMLButtonElement>(app, '#importDeckButt
 const importDeckInput = requireElement<HTMLInputElement>(app, '#importDeckInput')
 const editModelButton = requireElement<HTMLButtonElement>(app, '#editModelButton')
 const editDeckButton = requireElement<HTMLButtonElement>(app, '#editDeckButton')
+const editSelectionButton = requireElement<HTMLButtonElement>(app, '#editSelectionButton')
 const openPrintModalButton = requireElement<HTMLButtonElement>(app, '#openPrintModalButton')
 const printModal = requireElement<HTMLDivElement>(app, '#printModal')
 const printModalBackdrop = requireElement<HTMLDivElement>(app, '#printModalBackdrop')
@@ -794,6 +1593,9 @@ const generateDeckPrintPdfButton = requireElement<HTMLButtonElement>(app, '#gene
 const exportPngButton = requireElement<HTMLButtonElement>(app, '#exportPngButton')
 const canvasStage = requireElement<HTMLDivElement>(app, '#canvasStage')
 const layersSection = requireElement<HTMLElement>(app, '#layersSection')
+const editSection = requireElement<HTMLElement>(app, '#editSection')
+const editItemLabel = requireElement<HTMLParagraphElement>(app, '#editItemLabel')
+const editPanelContent = requireElement<HTMLDivElement>(app, '#editPanelContent')
 const cardsSection = requireElement<HTMLElement>(app, '#cardsSection')
 const cardThumbnails = requireElement<HTMLDivElement>(app, '#cardThumbnails')
 const cardCountLabel = requireElement<HTMLParagraphElement>(app, '#cardCountLabel')
@@ -824,21 +1626,271 @@ let layerCount = 0
 let suppressSelectionSync = false
 let draggedLayerId: string | null = null
 let canvasDisplayZoom = 1
+let activeRightPanelTab: 'cards' | 'edit' | 'model-layers' = 'cards'
+let selectedTextEditor: Editor | null = null
 
 deckDocuments = [createDeckDocument(DEFAULT_DECK_NAME)]
 activeDeckId = deckDocuments[0].id
 
 function renderWorkspaceTabs(): void {
   const modelActive = activeEditMode === 'model'
+  const selectedObject = canvas.getActiveObject()
+  const showEditTab = !modelActive && Boolean(selectedObject)
+
+  if (modelActive) {
+    activeRightPanelTab = 'model-layers'
+  } else if (activeRightPanelTab === 'model-layers') {
+    activeRightPanelTab = 'cards'
+  }
+
+  if (!showEditTab && activeRightPanelTab === 'edit') {
+    activeRightPanelTab = 'cards'
+  }
+
   editModelButton.classList.toggle('is-active', modelActive)
   editDeckButton.classList.toggle('is-active', !modelActive)
+  editSelectionButton.hidden = !showEditTab
+  editSelectionButton.classList.toggle('is-active', !modelActive && activeRightPanelTab === 'edit')
 
-  layersSection.hidden = !modelActive
-  cardsSection.hidden = modelActive
-  layersSection.classList.toggle('tab-panel-hidden', !modelActive)
-  cardsSection.classList.toggle('tab-panel-hidden', modelActive)
+  const showLayers = modelActive
+  const showCards = !modelActive && activeRightPanelTab === 'cards'
+  const showEdit = !modelActive && showEditTab && activeRightPanelTab === 'edit'
 
-  if (!modelActive) renderCardThumbnails()
+  layersSection.hidden = !showLayers
+  cardsSection.hidden = !showCards
+  editSection.hidden = !showEdit
+  layersSection.classList.toggle('tab-panel-hidden', !showLayers)
+  cardsSection.classList.toggle('tab-panel-hidden', !showCards)
+  editSection.classList.toggle('tab-panel-hidden', !showEdit)
+
+  if (showLayers) {
+    renderLayersAccordion()
+  } else {
+    layersAccordion.innerHTML = ''
+  }
+
+  if (showEdit) {
+    renderSelectedItemEditor()
+  } else {
+    destroySelectedTextEditor()
+  }
+
+  syncModeControls()
+  if (showCards) renderCardThumbnails()
+}
+
+function syncModeControls(): void {
+  const modelActive = activeEditMode === 'model'
+  addGraphicButton.disabled = !modelActive
+  addTextButton.disabled = !modelActive
+  baseImageInput.disabled = !modelActive
+
+  addGraphicButton.title = modelActive ? '' : 'No modo Baralho, edite apenas os layers existentes.'
+  addTextButton.title = modelActive ? '' : 'No modo Baralho, edite apenas os textos existentes.'
+  baseImageInput.title = modelActive ? '' : 'A carta base so pode ser alterada no modo Modelo.'
+}
+
+function destroySelectedTextEditor(): void {
+  if (!selectedTextEditor) {
+    return
+  }
+
+  selectedTextEditor.destroy()
+  selectedTextEditor = null
+}
+
+function selectedDeckEditableObject(): FabricObject | null {
+  if (activeEditMode !== 'deck') {
+    return null
+  }
+
+  const object = canvas.getActiveObject()
+  if (!object) {
+    return null
+  }
+
+  const meta = getLayerMeta(object)
+  const canEdit = meta.scope === 'model' && (meta.kind === 'text' || meta.kind === 'image')
+  return canEdit ? object : null
+}
+
+function renderEditEmptyMessage(message: string): void {
+  destroySelectedTextEditor()
+  editPanelContent.innerHTML = ''
+  const empty = document.createElement('p')
+  empty.className = 'layer-note'
+  empty.textContent = message
+  editPanelContent.append(empty)
+}
+
+function commitDeckContentChanges(): void {
+  canvas.requestRenderAll()
+  persistActiveDeckDocument()
+  renderCardThumbnails()
+}
+
+function createEditorToolbarButton(label: string, onClick: () => void): HTMLButtonElement {
+  const button = document.createElement('button')
+  button.type = 'button'
+  button.className = 'tiny ghost'
+  button.textContent = label
+  button.addEventListener('click', onClick)
+  return button
+}
+
+function renderSelectedTextEditor(textObject: FabricText | Textbox): void {
+  const meta = getLayerMeta(textObject)
+  const title = document.createElement('p')
+  title.className = 'layer-note'
+  title.textContent = 'Editor de texto da carta (individual).'
+  editPanelContent.append(title)
+
+  const toolbar = document.createElement('div')
+  toolbar.className = 'rich-toolbar'
+
+  const colorInput = document.createElement('input')
+  colorInput.type = 'color'
+  colorInput.value = '#2f9e44'
+  attachNoDragPropagation(colorInput)
+
+  const applyColorButton = createEditorToolbarButton('Cor', () => {
+    selectedTextEditor?.chain().focus().setColor(colorInput.value).run()
+  })
+  const clearColorButton = createEditorToolbarButton('Limpar cor', () => {
+    selectedTextEditor?.chain().focus().unsetColor().run()
+  })
+  const boldButton = createEditorToolbarButton('Negrito', () => {
+    selectedTextEditor?.chain().focus().toggleBold().run()
+  })
+  const italicButton = createEditorToolbarButton('Itálico', () => {
+    selectedTextEditor?.chain().focus().toggleItalic().run()
+  })
+  const underlineButton = createEditorToolbarButton('Sublinhado', () => {
+    selectedTextEditor?.chain().focus().toggleUnderline().run()
+  })
+  const clearMarksButton = createEditorToolbarButton('Limpar estilo', () => {
+    selectedTextEditor?.chain().focus().unsetAllMarks().run()
+  })
+
+  toolbar.append(boldButton, italicButton, underlineButton, colorInput, applyColorButton, clearColorButton, clearMarksButton)
+  editPanelContent.append(toolbar)
+  editPanelContent.append(detailsRow('Meus 5 estilos', createSavedTextColorPalette((style) => {
+    selectedTextEditor?.chain().focus().setMark('textStyle', {
+      color: style.color,
+      backgroundColor: style.backgroundColor,
+      borderRadius: `${style.borderRadius}px`,
+      textPadding: `${style.paddingY}px ${style.paddingX}px`,
+      presetFontSize: `${style.fontSize}px`,
+    }).run()
+  })))
+
+  const editorElement = document.createElement('div')
+  editorElement.className = 'rich-editor-surface'
+  editPanelContent.append(editorElement)
+
+  destroySelectedTextEditor()
+
+  const initialHtml = meta.richTextFormat === 'html' && meta.richTextSource
+    ? meta.richTextSource
+    : String((textObject as { text?: unknown }).text ?? '')
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/\n/g, '<br>')
+
+  selectedTextEditor = new Editor({
+    element: editorElement,
+    extensions: [
+      StarterKit.configure({
+        blockquote: false,
+        bulletList: false,
+        orderedList: false,
+        codeBlock: false,
+        heading: false,
+        horizontalRule: false,
+      }),
+      StyledTextStyle,
+      Color,
+      Underline,
+    ],
+    content: initialHtml,
+    onUpdate: ({ editor }) => {
+      const html = editor.getHTML()
+      applyRichTextToObject(textObject, html, 'html')
+      textObject.setCoords()
+      commitDeckContentChanges()
+    },
+  })
+
+  const fontFamilyField = createFontSelect(String((textObject as { fontFamily?: unknown }).fontFamily ?? 'Arial'))
+  attachNoDragPropagation(fontFamilyField)
+  fontFamilyField.addEventListener('change', () => {
+    textObject.set({ fontFamily: fontFamilyField.value })
+    commitDeckContentChanges()
+  })
+  editPanelContent.append(detailsRow('Fonte', fontFamilyField))
+
+  const fontSizeField = document.createElement('input')
+  fontSizeField.type = 'number'
+  fontSizeField.min = '8'
+  fontSizeField.max = '220'
+  fontSizeField.step = '1'
+  fontSizeField.value = String((textObject as { fontSize?: unknown }).fontSize ?? 40)
+  attachNoDragPropagation(fontSizeField)
+  fontSizeField.addEventListener('input', () => {
+    textObject.set({ fontSize: clamp(8, 220, Number(fontSizeField.value) || 40) })
+    commitDeckContentChanges()
+  })
+  editPanelContent.append(detailsRow('Tamanho', fontSizeField))
+
+  const alignField = document.createElement('select')
+  attachNoDragPropagation(alignField)
+  ;(['left', 'center', 'right', 'justify'] as TextAlignMode[]).forEach((align) => {
+    const option = document.createElement('option')
+    option.value = align
+    option.textContent = align
+    option.selected = normalizeTextAlign((textObject as { textAlign?: unknown }).textAlign, 'left') === align
+    alignField.append(option)
+  })
+  alignField.addEventListener('change', () => {
+    textObject.set({ textAlign: alignField.value as TextAlignMode })
+    commitDeckContentChanges()
+  })
+  editPanelContent.append(detailsRow('Alinhamento', alignField))
+}
+
+function renderSelectedImageEditor(imageObject: FabricImage): void {
+  const note = document.createElement('p')
+  note.className = 'layer-note'
+  note.textContent = 'Troque a ilustração apenas desta carta.'
+  editPanelContent.append(note)
+  editPanelContent.append(createImageBehaviorControls(imageObject))
+}
+
+function renderSelectedItemEditor(): void {
+  editPanelContent.innerHTML = ''
+  const selected = selectedDeckEditableObject()
+  if (!selected) {
+    editItemLabel.textContent = 'Selecione um item da carta para editar.'
+    renderEditEmptyMessage('Nenhum item editável selecionado nesta carta.')
+    return
+  }
+
+  const meta = getLayerMeta(selected)
+  editItemLabel.textContent = `${meta.name} • ${meta.kind === 'text' ? 'Texto' : 'Imagem'}`
+
+  if (meta.kind === 'text' && isTextLayer(selected)) {
+    renderSelectedTextEditor(selected)
+    return
+  }
+
+  if (meta.kind === 'image' && selected instanceof FabricImage) {
+    destroySelectedTextEditor()
+    renderSelectedImageEditor(selected)
+    return
+  }
+
+  renderEditEmptyMessage('Este item não possui controles de edição nesta visualização.')
 }
 
 function renderCardThumbnails(): void {
@@ -998,6 +2050,8 @@ function getLayerMeta(object: FabricObject): LayerMeta {
     fit: kind === 'image' ? normalizeImageFit(raw?.fit ?? 'contain') : undefined,
     slotWidth: raw?.slotWidth,
     slotHeight: raw?.slotHeight,
+    richTextSource: typeof raw?.richTextSource === 'string' ? raw.richTextSource : undefined,
+    richTextFormat: raw?.richTextFormat === 'html' ? 'html' : 'tags',
   }
   setLayerMeta(object, meta)
   return meta
@@ -1114,18 +2168,20 @@ function applyRuntimeConfig(object: FabricObject): void {
     padding: 4,
   })
 
-  const editable = meta.kind !== 'base' && (meta.scope === activeEditMode || canEditCardModelContent)
+  const fullyEditable = meta.kind !== 'base' && meta.scope === activeEditMode
+  const contentOnlyEditable = meta.kind !== 'base' && !fullyEditable && canEditCardModelContent
+  const selectable = fullyEditable || contentOnlyEditable
 
   object.set({
-    selectable: editable,
-    evented: editable,
-    lockMovementX: !editable,
-    lockMovementY: !editable,
-    lockRotation: !editable,
-    lockScalingX: !editable,
-    lockScalingY: !editable,
-    hasControls: editable,
-    editable: meta.kind === 'text' && editable,
+    selectable,
+    evented: selectable,
+    lockMovementX: !fullyEditable,
+    lockMovementY: !fullyEditable,
+    lockRotation: !fullyEditable,
+    lockScalingX: !fullyEditable,
+    lockScalingY: !fullyEditable,
+    hasControls: fullyEditable,
+    editable: meta.kind === 'text' && selectable,
   })
 }
 
@@ -1508,18 +2564,251 @@ function renderLayersAccordion(): void {
 
         if (meta.kind === 'text' && isTextLayer(object)) {
           const textObject = object as FabricText | Textbox
-          const textField = document.createElement('textarea')
-          textField.rows = 3
-          textField.value = String((textObject as any).text ?? '')
-          attachNoDragPropagation(textField)
-          textField.addEventListener('input', () => {
-            textObject.set({ text: textField.value })
+          const commitCardTextChanges = () => {
             textObject.setCoords()
             canvas.requestRenderAll()
             persistActiveDeckDocument()
             renderCardThumbnails()
+          }
+
+          const hint = document.createElement('p')
+          hint.className = 'layer-note'
+          hint.textContent =
+            'Cores por trecho: use <verde>texto</verde>, <#ff8800>texto</#ff8800>, [cor=verde]texto[/cor] ou [color=#ff8800]texto[/color].'
+          body.append(hint)
+
+          const textField = document.createElement('textarea')
+          textField.rows = 3
+          textField.value = meta.richTextSource ?? String((textObject as any).text ?? '')
+          attachNoDragPropagation(textField)
+          textField.addEventListener('input', () => {
+            applyTaggedTextToObject(textObject, textField.value)
+            commitCardTextChanges()
           })
-          body.append(detailsRow('Texto da carta', textField))
+          body.append(detailsRow('Texto da carta (com tags)', textField))
+
+          const tagSyntaxField = document.createElement('select')
+          attachNoDragPropagation(tagSyntaxField)
+          ;[
+            { value: 'html', label: '<verde>texto</verde>' },
+            { value: 'bbcode', label: '[cor=verde]texto[/cor]' },
+          ].forEach((item) => {
+            const option = document.createElement('option')
+            option.value = item.value
+            option.textContent = item.label
+            tagSyntaxField.append(option)
+          })
+          body.append(detailsRow('Formato da tag de cor', tagSyntaxField))
+
+          const palette = document.createElement('div')
+          palette.className = 'text-color-palette'
+          const paletteEntries: Array<{ label: string; token: string; color: string }> = [
+            { label: 'Verde', token: 'verde', color: '#2f9e44' },
+            { label: 'Vermelho', token: 'vermelho', color: '#d90429' },
+            { label: 'Azul', token: 'azul', color: '#1971c2' },
+            { label: 'Amarelo', token: 'amarelo', color: '#f08c00' },
+            { label: 'Roxo', token: 'roxo', color: '#6f42c1' },
+            { label: 'Rosa', token: 'rosa', color: '#d63384' },
+            { label: 'Preto', token: 'preto', color: '#111111' },
+            { label: 'Branco', token: 'branco', color: '#ffffff' },
+            { label: 'Bronze', token: 'bronze', color: '#cd7f32' },
+            { label: 'Prata', token: 'prata', color: '#a8a9ad' },
+          ]
+
+          paletteEntries.forEach(({ label, token, color }) => {
+            const swatch = document.createElement('button')
+            swatch.type = 'button'
+            swatch.className = 'text-color-swatch'
+            swatch.title = `Aplicar ${label}`
+            swatch.setAttribute('aria-label', `Aplicar ${label}`)
+            swatch.style.setProperty('--swatch-color', color)
+            swatch.addEventListener('click', () => {
+              wrapSelectionWithColor(textField, token, tagSyntaxField.value === 'bbcode' ? 'bbcode' : 'html')
+            })
+            palette.append(swatch)
+          })
+          body.append(detailsRow('Paleta rápida', palette))
+          body.append(detailsRow('Meus 5 estilos', createSavedTextColorPalette((style) => {
+            wrapSelectionWithColor(textField, style.color, tagSyntaxField.value === 'bbcode' ? 'bbcode' : 'html')
+          })))
+
+          const customColorField = document.createElement('input')
+          customColorField.type = 'color'
+          customColorField.value = '#ff8800'
+          attachNoDragPropagation(customColorField)
+          body.append(detailsRow('Tag com cor personalizada', customColorField))
+
+          const applyCustomColorButton = document.createElement('button')
+          applyCustomColorButton.type = 'button'
+          applyCustomColorButton.className = 'tiny ghost'
+          applyCustomColorButton.textContent = 'Aplicar cor na selecao'
+          applyCustomColorButton.addEventListener('click', () => {
+            wrapSelectionWithColor(
+              textField,
+              customColorField.value,
+              tagSyntaxField.value === 'bbcode' ? 'bbcode' : 'html',
+            )
+          })
+          body.append(detailsRow('Aplicar cor custom', applyCustomColorButton))
+
+          const fontFamilyField = createFontSelect(String((textObject as any).fontFamily ?? 'Arial'))
+          attachNoDragPropagation(fontFamilyField)
+          fontFamilyField.addEventListener('change', () => {
+            textObject.set({ fontFamily: fontFamilyField.value })
+            commitCardTextChanges()
+          })
+          body.append(detailsRow('Fonte', fontFamilyField))
+
+          const fontSizeField = document.createElement('input')
+          fontSizeField.type = 'number'
+          fontSizeField.min = '8'
+          fontSizeField.max = '220'
+          fontSizeField.step = '1'
+          fontSizeField.value = String((textObject as any).fontSize ?? 40)
+          attachNoDragPropagation(fontSizeField)
+          fontSizeField.addEventListener('input', () => {
+            textObject.set({ fontSize: clamp(8, 220, Number(fontSizeField.value) || 40) })
+            commitCardTextChanges()
+          })
+          body.append(detailsRow('Tamanho', fontSizeField))
+
+          const fillField = document.createElement('input')
+          fillField.type = 'color'
+          fillField.value = toHexColor(String((textObject as any).fill ?? '#1c2738'), '#1c2738')
+          attachNoDragPropagation(fillField)
+          fillField.addEventListener('input', () => {
+            textObject.set({ fill: fillField.value })
+            const currentMeta = getLayerMeta(textObject)
+            const sourceText = currentMeta.richTextSource ?? String((textObject as any).text ?? '')
+            applyTaggedTextToObject(textObject, sourceText)
+            commitCardTextChanges()
+          })
+          body.append(detailsRow('Cor base do texto', fillField))
+
+          const strokeColorField = document.createElement('input')
+          strokeColorField.type = 'color'
+          strokeColorField.value = toHexColor(String((textObject as any).stroke ?? '#000000'), '#000000')
+          attachNoDragPropagation(strokeColorField)
+          strokeColorField.addEventListener('input', () => {
+            textObject.set({ stroke: strokeColorField.value })
+            commitCardTextChanges()
+          })
+          body.append(detailsRow('Cor da borda', strokeColorField))
+
+          const strokeWidthField = document.createElement('input')
+          strokeWidthField.type = 'number'
+          strokeWidthField.min = '0'
+          strokeWidthField.max = '20'
+          strokeWidthField.step = '0.2'
+          strokeWidthField.value = String((textObject as any).strokeWidth ?? 0)
+          attachNoDragPropagation(strokeWidthField)
+          strokeWidthField.addEventListener('input', () => {
+            textObject.set({ strokeWidth: clamp(0, 20, Number(strokeWidthField.value) || 0) })
+            commitCardTextChanges()
+          })
+          body.append(detailsRow('Espessura da borda', strokeWidthField))
+
+          const alignField = document.createElement('select')
+          attachNoDragPropagation(alignField)
+          ;(['left', 'center', 'right', 'justify'] as TextAlignMode[]).forEach((align) => {
+            const option = document.createElement('option')
+            option.value = align
+            option.textContent = align
+            option.selected = normalizeTextAlign((textObject as any).textAlign, 'left') === align
+            alignField.append(option)
+          })
+          alignField.addEventListener('change', () => {
+            textObject.set({ textAlign: alignField.value as TextAlignMode })
+            commitCardTextChanges()
+          })
+          body.append(detailsRow('Alinhamento', alignField))
+
+          const lineHeightField = document.createElement('input')
+          lineHeightField.type = 'number'
+          lineHeightField.min = '0.6'
+          lineHeightField.max = '3'
+          lineHeightField.step = '0.05'
+          lineHeightField.value = String((textObject as any).lineHeight ?? 1.16)
+          attachNoDragPropagation(lineHeightField)
+          lineHeightField.addEventListener('input', () => {
+            textObject.set({ lineHeight: clamp(0.6, 3, Number(lineHeightField.value) || 1.16) })
+            commitCardTextChanges()
+          })
+          body.append(detailsRow('Espacamento de linha', lineHeightField))
+
+          const boldField = document.createElement('input')
+          boldField.type = 'checkbox'
+          boldField.checked = String((textObject as any).fontWeight ?? '').toLowerCase() === 'bold'
+          attachNoDragPropagation(boldField)
+          boldField.addEventListener('change', () => {
+            textObject.set({ fontWeight: boldField.checked ? 'bold' : 'normal' })
+            commitCardTextChanges()
+          })
+          body.append(detailsRow('Negrito', boldField))
+
+          const italicField = document.createElement('input')
+          italicField.type = 'checkbox'
+          italicField.checked = String((textObject as any).fontStyle ?? '').toLowerCase() === 'italic'
+          attachNoDragPropagation(italicField)
+          italicField.addEventListener('change', () => {
+            textObject.set({ fontStyle: italicField.checked ? 'italic' : 'normal' })
+            commitCardTextChanges()
+          })
+          body.append(detailsRow('Italico', italicField))
+
+          const underlineField = document.createElement('input')
+          underlineField.type = 'checkbox'
+          underlineField.checked = Boolean((textObject as any).underline)
+          attachNoDragPropagation(underlineField)
+          underlineField.addEventListener('change', () => {
+            textObject.set({ underline: underlineField.checked })
+            commitCardTextChanges()
+          })
+          body.append(detailsRow('Sublinhado', underlineField))
+
+          const rawShadow = (textObject as any).shadow as
+            | { color?: string; blur?: number; offsetX?: number; offsetY?: number }
+            | null
+          const shadowEnabledField = document.createElement('input')
+          shadowEnabledField.type = 'checkbox'
+          shadowEnabledField.checked = Boolean(rawShadow)
+          attachNoDragPropagation(shadowEnabledField)
+          body.append(detailsRow('Sombra', shadowEnabledField))
+
+          const shadowColorField = document.createElement('input')
+          shadowColorField.type = 'color'
+          shadowColorField.value = toHexColor(String(rawShadow?.color ?? '#000000'), '#000000')
+          attachNoDragPropagation(shadowColorField)
+          body.append(detailsRow('Cor da sombra', shadowColorField))
+
+          const shadowBlurField = document.createElement('input')
+          shadowBlurField.type = 'number'
+          shadowBlurField.min = '0'
+          shadowBlurField.max = '60'
+          shadowBlurField.step = '1'
+          shadowBlurField.value = String(rawShadow?.blur ?? 0)
+          attachNoDragPropagation(shadowBlurField)
+          body.append(detailsRow('Blur da sombra', shadowBlurField))
+
+          const applyShadow = () => {
+            if (!shadowEnabledField.checked) {
+              textObject.set({ shadow: null })
+            } else {
+              textObject.set({
+                shadow: {
+                  color: shadowColorField.value,
+                  blur: clamp(0, 60, Number(shadowBlurField.value) || 0),
+                  offsetX: 2,
+                  offsetY: 2,
+                },
+              })
+            }
+            commitCardTextChanges()
+          }
+
+          shadowEnabledField.addEventListener('change', applyShadow)
+          shadowColorField.addEventListener('input', applyShadow)
+          shadowBlurField.addEventListener('input', applyShadow)
         }
 
         if (meta.kind === 'image' && object instanceof FabricImage) {
@@ -1612,16 +2901,63 @@ function renderLayersAccordion(): void {
     if (isTextLayer(object)) {
       const textObject = object as FabricText | Textbox
 
+      const textHint = document.createElement('p')
+      textHint.className = 'layer-note'
+      textHint.textContent =
+        'Selecione um trecho e aplique uma cor. Exemplo: role um <bronze>D10</bronze> e um <prata>D2</prata>.'
+      body.append(textHint)
+
       const textField = document.createElement('textarea')
       textField.rows = 3
-      textField.value = (textObject as any).text ?? 'Texto'
+      textField.value = getLayerMeta(textObject).richTextSource ?? String((textObject as any).text ?? 'Texto')
       attachNoDragPropagation(textField)
       textField.addEventListener('input', () => {
-        textObject.set({ text: textField.value })
+        applyTaggedTextToObject(textObject, textField.value)
         textObject.setCoords()
         canvas.requestRenderAll()
       })
-      body.append(detailsRow('Texto (use Enter para quebra de linha)', textField))
+      body.append(detailsRow('Texto (com cores por trecho)', textField))
+
+      const textPalette = document.createElement('div')
+      textPalette.className = 'text-color-palette'
+      ;[
+        { label: 'Bronze', token: 'bronze', color: '#cd7f32' },
+        { label: 'Prata', token: 'prata', color: '#a8a9ad' },
+        { label: 'Dourado', token: 'dourado', color: '#d4a017' },
+        { label: 'Verde', token: 'verde', color: '#2f9e44' },
+        { label: 'Vermelho', token: 'vermelho', color: '#d90429' },
+        { label: 'Azul', token: 'azul', color: '#1971c2' },
+        { label: 'Roxo', token: 'roxo', color: '#6f42c1' },
+      ].forEach(({ label, token, color }) => {
+        const swatch = document.createElement('button')
+        swatch.type = 'button'
+        swatch.className = 'text-color-swatch'
+        swatch.title = `Aplicar ${label}`
+        swatch.setAttribute('aria-label', `Aplicar ${label}`)
+        swatch.style.setProperty('--swatch-color', color)
+        swatch.addEventListener('click', () => wrapSelectionWithColor(textField, token, 'html'))
+        textPalette.append(swatch)
+      })
+      body.append(detailsRow('Cores rápidas', textPalette))
+      body.append(detailsRow('Meus 5 estilos', createSavedTextColorPalette((style) => {
+        wrapSelectionWithColor(textField, style.color, 'html')
+      })))
+
+      const customInlineColor = document.createElement('input')
+      customInlineColor.type = 'color'
+      customInlineColor.value = '#cd7f32'
+      attachNoDragPropagation(customInlineColor)
+      const applyInlineColor = document.createElement('button')
+      applyInlineColor.type = 'button'
+      applyInlineColor.className = 'tiny ghost'
+      applyInlineColor.textContent = 'Aplicar à seleção'
+      applyInlineColor.addEventListener('click', () => {
+        wrapSelectionWithColor(textField, customInlineColor.value, 'html')
+      })
+      const customInlineControls = document.createElement('div')
+      customInlineControls.className = 'inline-color-controls'
+      customInlineControls.append(customInlineColor, applyInlineColor)
+      body.append(detailsRow('Cor personalizada', customInlineControls))
 
       const fontFamilyField = createFontSelect(String((textObject as any).fontFamily ?? 'Arial'))
       attachNoDragPropagation(fontFamilyField)
@@ -1651,9 +2987,11 @@ function renderLayersAccordion(): void {
       attachNoDragPropagation(fillField)
       fillField.addEventListener('input', () => {
         textObject.set({ fill: fillField.value })
+        const sourceText = getLayerMeta(textObject).richTextSource ?? String((textObject as any).text ?? '')
+        applyTaggedTextToObject(textObject, sourceText)
         canvas.requestRenderAll()
       })
-      body.append(detailsRow('Cor do texto', fillField))
+      body.append(detailsRow('Cor base do texto', fillField))
 
       const strokeColorField = document.createElement('input')
       strokeColorField.type = 'color'
@@ -2333,8 +3671,30 @@ function attachCanvasDnD(): void {
   })
 }
 
-editModelButton.addEventListener('click', () => { void switchToModelView() })
-editDeckButton.addEventListener('click', () => { void switchToCardView() })
+editModelButton.addEventListener('click', () => {
+  if (activeEditMode === 'model') {
+    activeRightPanelTab = 'model-layers'
+    renderWorkspaceTabs()
+    return
+  }
+  void switchToModelView()
+})
+
+editDeckButton.addEventListener('click', () => {
+  if (activeEditMode === 'deck') {
+    activeRightPanelTab = 'cards'
+    renderWorkspaceTabs()
+    return
+  }
+  void switchToCardView()
+})
+editSelectionButton.addEventListener('click', () => {
+  if (activeEditMode !== 'deck') {
+    return
+  }
+  activeRightPanelTab = 'edit'
+  renderWorkspaceTabs()
+})
 exportDeckButton.addEventListener('click', saveActiveDeckAsFile)
 
 importDeckButton.addEventListener('click', () => {
@@ -2359,10 +3719,18 @@ importDeckInput.addEventListener('change', async () => {
 addCardButton.addEventListener('click', addNewCard)
 
 addGraphicButton.addEventListener('click', () => {
+  if (activeEditMode !== 'model') {
+    window.alert('No modo Baralho, edite apenas os layers existentes da carta.')
+    return
+  }
   void addGraphicReferenceLayer()
 })
 
 addTextButton.addEventListener('click', () => {
+  if (activeEditMode !== 'model') {
+    window.alert('No modo Baralho, edite apenas os textos ja existentes da carta.')
+    return
+  }
   addTextLayer()
 })
 
@@ -2489,19 +3857,38 @@ window.addEventListener('keydown', (event) => {
 
 canvas.on('selection:created', () => {
   if (!suppressSelectionSync) {
-    renderLayersAccordion()
+    if (activeEditMode === 'model') {
+      renderLayersAccordion()
+      return
+    }
+    if (activeRightPanelTab !== 'edit') {
+      activeRightPanelTab = 'edit'
+    }
+    renderWorkspaceTabs()
   }
 })
 
 canvas.on('selection:updated', () => {
   if (!suppressSelectionSync) {
-    renderLayersAccordion()
+    if (activeEditMode === 'model') {
+      renderLayersAccordion()
+      return
+    }
+    if (activeRightPanelTab !== 'edit') {
+      activeRightPanelTab = 'edit'
+    }
+    renderWorkspaceTabs()
   }
 })
 
 canvas.on('selection:cleared', () => {
   if (!suppressSelectionSync) {
-    renderLayersAccordion()
+    if (activeEditMode === 'model') {
+      renderLayersAccordion()
+      return
+    }
+    activeRightPanelTab = 'cards'
+    renderWorkspaceTabs()
   }
 })
 
@@ -2514,7 +3901,11 @@ canvas.on('object:modified', (e) => {
       setLayerMeta(obj, { ...meta, slotWidth: Math.max(1, obj.getScaledWidth()), slotHeight: Math.max(1, obj.getScaledHeight()) })
     }
   }
-  renderLayersAccordion()
+  if (activeEditMode === 'model') {
+    renderLayersAccordion()
+  } else {
+    renderWorkspaceTabs()
+  }
   persistActiveDeckDocument()
 })
 
@@ -2534,6 +3925,7 @@ window.addEventListener('resize', () => {
 
 attachCanvasDnD()
 renderWorkspaceSidebar()
+syncModeControls()
 void loadActiveDeckCard(currentDeck()).then(async () => {
   await refreshDeckThumbnails(currentDeck())
 })
