@@ -13,13 +13,14 @@ import {
 import { jsPDF } from 'jspdf'
 import JSZip from 'jszip'
 import './style.css'
+import { withLoading } from './loading'
 
 type LayerKind =
   | 'base'
   | 'image'
   | 'text'
 
-type LayerScope = 'model' | 'deck'
+type LayerScope = 'model' | 'deck' | 'back'
 type EditMode = LayerScope
 type ImageFitMode = 'fill' | 'contain' | 'cover' | 'none' | 'scale-down'
 type TextAlignMode = 'left' | 'center' | 'right' | 'justify'
@@ -81,6 +82,7 @@ interface DeckDocument {
   id: string
   name: string
   modelCanvas: ReturnType<Canvas['toObject']>
+  backCanvas: ReturnType<Canvas['toObject']>
   cards: CardState[]
   activeCardId: string
 }
@@ -90,6 +92,22 @@ const app = document.querySelector<HTMLDivElement>('#app')
 if (!app) {
   throw new Error('Elemento #app nao encontrado.')
 }
+
+type ColorTheme = 'light' | 'dark'
+const COLOR_THEME_STORAGE_KEY = 'deckstudio.color-theme'
+
+function getInitialColorTheme(): ColorTheme {
+  const savedTheme = localStorage.getItem(COLOR_THEME_STORAGE_KEY)
+  if (savedTheme === 'light' || savedTheme === 'dark') return savedTheme
+  return window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light'
+}
+
+function applyColorTheme(theme: ColorTheme): void {
+  document.documentElement.dataset.theme = theme
+  document.documentElement.style.colorScheme = theme
+}
+
+applyColorTheme(getInitialColorTheme())
 
 const CARD_WIDTH = 630
 const CARD_HEIGHT = 880
@@ -233,6 +251,7 @@ function createDeckDocument(name = DEFAULT_DECK_NAME): DeckDocument {
     id: generateDeckId(),
     name,
     modelCanvas: createEmptyCanvasState(),
+    backCanvas: createEmptyCanvasState(),
     cards: [firstCard],
     activeCardId: firstCard.id,
   }
@@ -921,11 +940,13 @@ function applyImageFitForObject(object: FabricImage, fit: ImageFitMode): void {
 }
 
 async function replaceIllustrationOnObject(object: FabricImage, url: string, fit: ImageFitMode): Promise<void> {
-  const meta = getLayerMeta(object)
-  await object.setSrc(url)
-  applyImageFitForObject(object, fit)
-  setLayerMeta(object, { ...meta, fit, slotWidth: meta.slotWidth, slotHeight: meta.slotHeight })
-  object.setCoords()
+  return withLoading(async () => {
+    const meta = getLayerMeta(object)
+    await object.setSrc(url)
+    applyImageFitForObject(object, fit)
+    setLayerMeta(object, { ...meta, fit, slotWidth: meta.slotWidth, slotHeight: meta.slotHeight })
+    object.setCoords()
+  })
 }
 
 function selectedEditableImageObject(): FabricImage | null {
@@ -1127,17 +1148,19 @@ async function captureDeckCardThumbnail(deck: DeckDocument, cardId: string): Pro
 }
 
 async function refreshDeckThumbnails(deck: DeckDocument): Promise<void> {
-  for (const card of deck.cards) {
-    try {
-      card.thumbnail = await captureDeckCardThumbnail(deck, card.id)
-    } catch {
-      card.thumbnail = ''
+  return withLoading(async () => {
+    for (const card of deck.cards) {
+      try {
+        card.thumbnail = await captureDeckCardThumbnail(deck, card.id)
+      } catch {
+        card.thumbnail = ''
+      }
     }
-  }
 
-  if (deck.id === activeDeckId && activeEditMode === 'deck') {
-    renderCardThumbnails()
-  }
+    if (deck.id === activeDeckId && activeEditMode === 'deck') {
+      renderCardThumbnails()
+    }
+  })
 }
 
 function persistActiveDeckDocument(): void {
@@ -1145,6 +1168,11 @@ function persistActiveDeckDocument(): void {
   const snapshot = canvas.toObject(['data'])
   const all = (snapshot.objects ?? []) as Array<{ data?: Partial<LayerMeta> }>
   const modelObjects = all.filter(o => o.data?.scope === 'model') as unknown[]
+
+  if (activeEditMode === 'back') {
+    deck.backCanvas = { ...snapshot }
+    return
+  }
 
   if (activeEditMode === 'model') {
     deck.modelCanvas = {
@@ -1282,7 +1310,7 @@ async function switchToCardView(): Promise<void> {
 }
 
 function normalizeScope(value: unknown, kind: LayerKind): LayerScope {
-  if (value === 'model' || value === 'deck') {
+  if (value === 'model' || value === 'deck' || value === 'back') {
     return value
   }
 
@@ -1337,6 +1365,7 @@ function migrateDeckDocument(raw: Record<string, unknown>): DeckDocument {
     const deck = raw as unknown as DeckDocument
     return {
       ...deck,
+      backCanvas: raw['backCanvas'] as ReturnType<Canvas['toObject']> || createEmptyCanvasState(),
       cards: deck.cards.map((card, index) => ({
         id: card.id || generateDeckId(),
         name: card.name || `Carta ${index + 1}`,
@@ -1365,6 +1394,7 @@ function migrateDeckDocument(raw: Record<string, unknown>): DeckDocument {
     id: (raw['id'] as string | undefined) ?? generateDeckId(),
     name: (raw['name'] as string | undefined) ?? DEFAULT_DECK_NAME,
     modelCanvas,
+    backCanvas: createEmptyCanvasState(),
     cards: [firstCard],
     activeCardId: firstCard.id,
   }
@@ -1380,6 +1410,7 @@ function deckFileSnapshot(): { version: 1; deck: DeckDocument } {
       id: deck.id,
       name: deck.name,
       modelCanvas: cloneCanvasState(deck.modelCanvas),
+      backCanvas: cloneCanvasState(deck.backCanvas),
       cards: deck.cards.map(c => ({
         id: c.id,
         name: c.name,
@@ -1398,6 +1429,11 @@ app.innerHTML = `
     <div class="menu-shell">
       <div class="menu-top">
         <h1 class="menu-brand">Deck Studio</h1>
+        <label class="file-name-field" for="deckNameInput">
+          Nome do arquivo
+          <input id="deckNameInput" type="text" placeholder="Baralho 1" aria-describedby="deckNameHint" />
+        </label>
+        <p id="deckNameHint" class="hint">A extensão .deck é adicionada ao salvar.</p>
         <p class="menu-caption">Ferramentas</p>
       </div>
 
@@ -1413,6 +1449,14 @@ app.innerHTML = `
       </nav>
 
       <div class="menu-footer">
+        <label class="theme-switch" for="themeSwitch">
+          <span class="theme-switch-label">
+            <span id="themeIcon" class="material-symbols-outlined" aria-hidden="true">dark_mode</span>
+            <span id="themeLabel">Modo escuro</span>
+          </span>
+          <input id="themeSwitch" type="checkbox" role="switch" aria-label="Ativar modo escuro" />
+          <span class="theme-switch-track" aria-hidden="true"><span class="theme-switch-thumb"></span></span>
+        </label>
         <button id="openPrintModalButton" class="menu-item menu-item-strong" type="button">
           <span class="material-symbols-outlined" aria-hidden="true">print</span>
           <span>Gerar baralho</span>
@@ -1426,24 +1470,31 @@ app.innerHTML = `
     </div>
   </section>
 
+  <div id="leftPanelResizer" class="panel-resizer" role="separator" aria-label="Redimensionar painel de ferramentas" aria-orientation="vertical" tabindex="0"></div>
+
   <section class="panel canvas-panel">
     <div class="zoom-controls">
       <button id="zoomOutButton" class="ghost tiny" type="button" aria-label="Diminuir zoom">-</button>
       <input id="zoomRange" type="range" min="20" max="400" step="5" value="100" />
       <span id="zoomLabel" class="zoom-label">100%</span>
       <button id="zoomInButton" class="ghost tiny" type="button" aria-label="Aumentar zoom">+</button>
-      <button id="zoomFitButton" class="ghost tiny" type="button">Ajustar carta</button>
+      <button id="zoomFitButton" class="ghost tiny zoom-fit-button" type="button" aria-label="Ajustar carta sem rolagem" title="Ajustar carta">
+        <span class="material-symbols-outlined" aria-hidden="true">fit_screen</span>
+      </button>
     </div>
     <div id="canvasStage" class="canvas-stage" aria-label="Editor visual da carta">
       <canvas id="cardCanvas" width="${CARD_WIDTH}" height="${CARD_HEIGHT}"></canvas>
     </div>
   </section>
 
+  <div id="rightPanelResizer" class="panel-resizer" role="separator" aria-label="Redimensionar painel lateral" aria-orientation="vertical" tabindex="0"></div>
+
   <div class="right-panel-host">
     <div class="right-panel-tab-bar">
       <button id="editDeckButton" class="tab-button is-active" type="button">Baralho</button>
       <button id="editSelectionButton" class="tab-button" type="button" hidden>Edição</button>
       <button id="editModelButton" class="tab-button" type="button">Modelo</button>
+      <button id="editBackButton" class="tab-button" type="button" title="Background (verso das cartas)">Verso</button>
     </div>
     <section id="cardsSection" class="panel cards-panel">
       <h2>Miniaturas</h2>
@@ -1569,9 +1620,11 @@ const addGraphicButton = requireElement<HTMLButtonElement>(app, '#addGraphicButt
 const imageInput = requireElement<HTMLInputElement>(app, '#imageInput')
 const baseImageInput = requireElement<HTMLInputElement>(app, '#baseImageInput')
 const exportDeckButton = requireElement<HTMLButtonElement>(app, '#exportDeckButton')
+const deckNameInput = requireElement<HTMLInputElement>(app, '#deckNameInput')
 const importDeckButton = requireElement<HTMLButtonElement>(app, '#importDeckButton')
 const importDeckInput = requireElement<HTMLInputElement>(app, '#importDeckInput')
 const editModelButton = requireElement<HTMLButtonElement>(app, '#editModelButton')
+const editBackButton = requireElement<HTMLButtonElement>(app, '#editBackButton')
 const editDeckButton = requireElement<HTMLButtonElement>(app, '#editDeckButton')
 const editSelectionButton = requireElement<HTMLButtonElement>(app, '#editSelectionButton')
 const openPrintModalButton = requireElement<HTMLButtonElement>(app, '#openPrintModalButton')
@@ -1592,6 +1645,7 @@ const generateDeckPrintZipButton = requireElement<HTMLButtonElement>(app, '#gene
 const generateDeckPrintPdfButton = requireElement<HTMLButtonElement>(app, '#generateDeckPrintPdfButton')
 const exportPngButton = requireElement<HTMLButtonElement>(app, '#exportPngButton')
 const canvasStage = requireElement<HTMLDivElement>(app, '#canvasStage')
+const canvasPanel = requireElement<HTMLElement>(app, '.canvas-panel')
 const layersSection = requireElement<HTMLElement>(app, '#layersSection')
 const editSection = requireElement<HTMLElement>(app, '#editSection')
 const editItemLabel = requireElement<HTMLParagraphElement>(app, '#editItemLabel')
@@ -1606,6 +1660,103 @@ const zoomInButton = requireElement<HTMLButtonElement>(app, '#zoomInButton')
 const zoomFitButton = requireElement<HTMLButtonElement>(app, '#zoomFitButton')
 const zoomRange = requireElement<HTMLInputElement>(app, '#zoomRange')
 const zoomLabel = requireElement<HTMLSpanElement>(app, '#zoomLabel')
+const themeSwitch = requireElement<HTMLInputElement>(app, '#themeSwitch')
+const themeLabel = requireElement<HTMLSpanElement>(app, '#themeLabel')
+const themeIcon = requireElement<HTMLSpanElement>(app, '#themeIcon')
+const editorLayout = requireElement<HTMLElement>(app, '.editor-layout')
+const leftPanelResizer = requireElement<HTMLDivElement>(app, '#leftPanelResizer')
+const rightPanelResizer = requireElement<HTMLDivElement>(app, '#rightPanelResizer')
+
+const PANEL_WIDTHS_STORAGE_KEY = 'deckstudio.panel-widths'
+
+function setPanelWidths(left: number, right: number): void {
+  editorLayout.style.setProperty('--left-panel-width', `${left}px`)
+  editorLayout.style.setProperty('--right-panel-width', `${right}px`)
+}
+
+function currentPanelWidths(): { left: number; right: number } {
+  const styles = getComputedStyle(editorLayout)
+  return {
+    left: Number.parseFloat(styles.getPropertyValue('--left-panel-width')) || 220,
+    right: Number.parseFloat(styles.getPropertyValue('--right-panel-width')) || 360,
+  }
+}
+
+try {
+  const saved = JSON.parse(localStorage.getItem(PANEL_WIDTHS_STORAGE_KEY) ?? '{}') as { left?: number; right?: number }
+  if (Number.isFinite(saved.left) && Number.isFinite(saved.right)) setPanelWidths(saved.left!, saved.right!)
+} catch {
+  // Ignora preferências antigas ou inválidas.
+}
+
+function attachPanelResizer(handle: HTMLElement, side: 'left' | 'right'): void {
+  const resizeBy = (delta: number): void => {
+    const widths = currentPanelWidths()
+    const available = editorLayout.clientWidth
+    const maxLeft = Math.min(420, available - widths.right - 420)
+    const maxRight = Math.min(520, available - widths.left - 420)
+    const left = side === 'left' ? clamp(180, Math.max(180, maxLeft), widths.left + delta) : widths.left
+    const right = side === 'right' ? clamp(280, Math.max(280, maxRight), widths.right - delta) : widths.right
+    setPanelWidths(left, right)
+    fitCanvasZoomToStage()
+  }
+
+  handle.addEventListener('pointerdown', (event) => {
+    const startX = event.clientX
+    const start = currentPanelWidths()
+    handle.setPointerCapture(event.pointerId)
+    document.body.classList.add('is-resizing-panels')
+
+    const move = (moveEvent: PointerEvent): void => {
+      setPanelWidths(start.left, start.right)
+      resizeBy(moveEvent.clientX - startX)
+    }
+    const stop = (): void => {
+      handle.removeEventListener('pointermove', move)
+      document.body.classList.remove('is-resizing-panels')
+      localStorage.setItem(PANEL_WIDTHS_STORAGE_KEY, JSON.stringify(currentPanelWidths()))
+    }
+    handle.addEventListener('pointermove', move)
+    handle.addEventListener('pointerup', stop, { once: true })
+    handle.addEventListener('pointercancel', stop, { once: true })
+  })
+
+  handle.addEventListener('keydown', (event) => {
+    if (event.key !== 'ArrowLeft' && event.key !== 'ArrowRight') return
+    event.preventDefault()
+    resizeBy(event.key === 'ArrowRight' ? 12 : -12)
+    localStorage.setItem(PANEL_WIDTHS_STORAGE_KEY, JSON.stringify(currentPanelWidths()))
+  })
+}
+
+attachPanelResizer(leftPanelResizer, 'left')
+attachPanelResizer(rightPanelResizer, 'right')
+
+function syncThemeSwitch(theme: ColorTheme): void {
+  const isDark = theme === 'dark'
+  themeSwitch.checked = isDark
+  themeSwitch.setAttribute('aria-label', isDark ? 'Ativar modo claro' : 'Ativar modo escuro')
+  themeLabel.textContent = isDark ? 'Modo escuro' : 'Modo claro'
+  themeIcon.textContent = isDark ? 'dark_mode' : 'light_mode'
+}
+
+async function switchToBackView(): Promise<void> {
+  if (activeEditMode === 'back') return
+  persistActiveDeckDocument()
+  activeEditMode = 'back'
+  activeRightPanelTab = 'model-layers'
+  destroySelectedTextEditor()
+  await loadDeckCanvas(currentDeck().backCanvas)
+  renderWorkspaceTabs()
+}
+
+syncThemeSwitch(getInitialColorTheme())
+themeSwitch.addEventListener('change', () => {
+  const theme: ColorTheme = themeSwitch.checked ? 'dark' : 'light'
+  applyColorTheme(theme)
+  localStorage.setItem(COLOR_THEME_STORAGE_KEY, theme)
+  syncThemeSwitch(theme)
+})
 
 const canvas = new Canvas('cardCanvas', {
   preserveObjectStacking: true,
@@ -1634,10 +1785,12 @@ activeDeckId = deckDocuments[0].id
 
 function renderWorkspaceTabs(): void {
   const modelActive = activeEditMode === 'model'
+  const backActive = activeEditMode === 'back'
+  const templateActive = modelActive || backActive
   const selectedObject = canvas.getActiveObject()
-  const showEditTab = !modelActive && Boolean(selectedObject)
+  const showEditTab = activeEditMode === 'deck' && Boolean(selectedObject)
 
-  if (modelActive) {
+  if (templateActive) {
     activeRightPanelTab = 'model-layers'
   } else if (activeRightPanelTab === 'model-layers') {
     activeRightPanelTab = 'cards'
@@ -1648,13 +1801,14 @@ function renderWorkspaceTabs(): void {
   }
 
   editModelButton.classList.toggle('is-active', modelActive)
-  editDeckButton.classList.toggle('is-active', !modelActive)
+  editBackButton.classList.toggle('is-active', backActive)
+  editDeckButton.classList.toggle('is-active', activeEditMode === 'deck')
   editSelectionButton.hidden = !showEditTab
   editSelectionButton.classList.toggle('is-active', !modelActive && activeRightPanelTab === 'edit')
 
-  const showLayers = modelActive
-  const showCards = !modelActive && activeRightPanelTab === 'cards'
-  const showEdit = !modelActive && showEditTab && activeRightPanelTab === 'edit'
+  const showLayers = templateActive
+  const showCards = activeEditMode === 'deck' && activeRightPanelTab === 'cards'
+  const showEdit = activeEditMode === 'deck' && showEditTab && activeRightPanelTab === 'edit'
 
   layersSection.hidden = !showLayers
   cardsSection.hidden = !showCards
@@ -1680,7 +1834,7 @@ function renderWorkspaceTabs(): void {
 }
 
 function syncModeControls(): void {
-  const modelActive = activeEditMode === 'model'
+  const modelActive = activeEditMode !== 'deck'
   addGraphicButton.disabled = !modelActive
   addTextButton.disabled = !modelActive
   baseImageInput.disabled = !modelActive
@@ -1931,6 +2085,18 @@ function renderCardThumbnails(): void {
 
     selectBtn.addEventListener('click', () => { selectCard(card.id) })
 
+    const actions = document.createElement('div')
+    actions.className = 'card-thumb-actions'
+
+    const duplicateBtn = document.createElement('button')
+    duplicateBtn.type = 'button'
+    duplicateBtn.className = 'tiny ghost card-thumb-duplicate'
+    duplicateBtn.textContent = 'Duplicar'
+    duplicateBtn.setAttribute('aria-label', `Duplicar ${card.name}`)
+    duplicateBtn.addEventListener('click', () => {
+      duplicateCard(card.id)
+    })
+
     const deleteBtn = document.createElement('button')
     deleteBtn.type = 'button'
     deleteBtn.className = 'tiny danger card-thumb-delete'
@@ -1940,7 +2106,8 @@ function renderCardThumbnails(): void {
       deleteCard(card.id)
     })
 
-    item.append(selectBtn, deleteBtn)
+    actions.append(duplicateBtn, deleteBtn)
+    item.append(selectBtn, actions)
     cardThumbnails.append(item)
   })
 
@@ -1972,52 +2139,76 @@ function deleteCard(cardId: string): void {
   renderCardThumbnails()
 }
 
+function duplicateCard(cardId: string): void {
+  persistActiveDeckDocument()
+  const deck = currentDeck()
+  const sourceIndex = deck.cards.findIndex((card) => card.id === cardId)
+  if (sourceIndex < 0) return
+
+  const sourceCard = deck.cards[sourceIndex]
+  const duplicatedCard: CardState = {
+    id: generateDeckId(),
+    name: `${sourceCard.name} - cópia`,
+    deckObjects: deepClone(sourceCard.deckObjects),
+    modelOverrides: deepClone(sourceCard.modelOverrides),
+    thumbnail: sourceCard.thumbnail,
+  }
+
+  deck.cards.splice(sourceIndex + 1, 0, duplicatedCard)
+  deck.activeCardId = duplicatedCard.id
+  void loadActiveDeckCard(deck, duplicatedCard.id)
+  renderCardThumbnails()
+}
+
 function renderWorkspaceSidebar(): void {
+  deckNameInput.value = currentDeck().name
   renderWorkspaceTabs()
 }
 
 async function loadDeckCanvas(state: ReturnType<Canvas['toObject']>): Promise<void> {
-  canvas.clear()
-  layerById.clear()
-  baseLayerId = ''
+  return withLoading(async () => {
+    canvas.clear()
+    layerById.clear()
+    baseLayerId = ''
 
-  await canvas.loadFromJSON(state)
+    await canvas.loadFromJSON(state)
 
-  const objects = canvas.getObjects()
-  objects.forEach((object) => {
-    const meta = getLayerMeta(object)
-    if (meta.kind === 'base') {
-      baseLayerId = meta.id
-    }
-
-    const currentScope = normalizeScope((object.get('data') as Partial<LayerMeta> | undefined)?.scope, meta.kind)
-    markObjectScope(object, currentScope)
-    applyRuntimeConfig(object)
-  })
-
-  if (activeEditMode === 'deck') {
-    canvas.getObjects().forEach((object) => {
+    const objects = canvas.getObjects()
+    objects.forEach((object) => {
       const meta = getLayerMeta(object)
-      if (meta.kind !== 'image' || meta.scope !== 'model' || !(object instanceof FabricImage)) {
-        return
+      if (meta.kind === 'base') {
+        baseLayerId = meta.id
       }
 
-      // use saved slot dimensions – never recalculate from natural image size
-      const fit = normalizeImageFit(meta.fit ?? 'contain')
-      const targetWidth = Math.max(1, meta.slotWidth ?? object.getScaledWidth?.() ?? object.width ?? 1)
-      const targetHeight = Math.max(1, meta.slotHeight ?? object.getScaledHeight?.() ?? object.height ?? 1)
-
-      applyImageFit(object, fit, targetWidth, targetHeight)
-      setLayerMeta(object, { ...meta, fit, slotWidth: targetWidth, slotHeight: targetHeight })
-      object.setCoords()
+      const currentScope = normalizeScope((object.get('data') as Partial<LayerMeta> | undefined)?.scope, meta.kind)
+      markObjectScope(object, currentScope)
+      applyRuntimeConfig(object)
     })
-  }
 
-  refreshLayerIndex()
-  renderLayersAccordion()
-  canvas.discardActiveObject()
-  canvas.requestRenderAll()
-  persistActiveDeckDocument()
+    if (activeEditMode === 'deck') {
+      canvas.getObjects().forEach((object) => {
+        const meta = getLayerMeta(object)
+        if (meta.kind !== 'image' || meta.scope !== 'model' || !(object instanceof FabricImage)) {
+          return
+        }
+
+        // use saved slot dimensions – never recalculate from natural image size
+        const fit = normalizeImageFit(meta.fit ?? 'contain')
+        const targetWidth = Math.max(1, meta.slotWidth ?? object.getScaledWidth?.() ?? object.width ?? 1)
+        const targetHeight = Math.max(1, meta.slotHeight ?? object.getScaledHeight?.() ?? object.height ?? 1)
+
+        applyImageFit(object, fit, targetWidth, targetHeight)
+        setLayerMeta(object, { ...meta, fit, slotWidth: targetWidth, slotHeight: targetHeight })
+        object.setCoords()
+      })
+    }
+
+    refreshLayerIndex()
+    renderLayersAccordion()
+    canvas.discardActiveObject()
+    canvas.requestRenderAll()
+    persistActiveDeckDocument()
+  })
 }
 
 function toHexColor(value: string, fallback: string): string {
@@ -2059,6 +2250,16 @@ function getLayerMeta(object: FabricObject): LayerMeta {
 
 function clamp(min: number, max: number, value: number): number {
   return Math.max(min, Math.min(max, value))
+}
+
+function syncDeckFilename(): void {
+  const name = deckNameInput.value
+    .trim()
+    .replace(/\.deck$/i, '')
+    .replace(/[<>:"/\\|?*\u0000-\u001f]/g, '-')
+    .replace(/[. ]+$/g, '')
+  currentDeck().name = name || DEFAULT_DECK_NAME
+  deckNameInput.value = currentDeck().name
 }
 
 function slugifyFilename(value: string): string {
@@ -2125,10 +2326,15 @@ function setCanvasZoom(zoom: number): void {
 }
 
 function fitCanvasZoomToStage(): void {
-  const availableWidth = Math.max(1, canvasStage.clientWidth - 20)
-  const availableHeight = Math.max(1, canvasStage.clientHeight - 20)
+  const stageStyle = getComputedStyle(canvasStage)
+  const horizontalPadding = Number.parseFloat(stageStyle.paddingLeft) + Number.parseFloat(stageStyle.paddingRight)
+  const verticalPadding = Number.parseFloat(stageStyle.paddingTop) + Number.parseFloat(stageStyle.paddingBottom)
+  const zoomToolbarAllowance = 58
+  const availableWidth = Math.max(1, canvasStage.clientWidth - horizontalPadding - zoomToolbarAllowance - 4)
+  const availableHeight = Math.max(1, canvasStage.clientHeight - verticalPadding - 4)
   const fit = Math.min(availableWidth / CARD_WIDTH, availableHeight / CARD_HEIGHT)
   setCanvasZoom(clamp(ZOOM_MIN, ZOOM_MAX, fit))
+  canvasStage.scrollTo({ left: 0, top: 0 })
 }
 
 function attachNoDragPropagation(control: HTMLElement): void {
@@ -3121,91 +3327,97 @@ function renderLayersAccordion(): void {
 }
 
 async function fileToDataUrl(file: File): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader()
-    reader.onload = () => {
-      if (typeof reader.result === 'string') {
-        resolve(reader.result)
-      } else {
-        reject(new Error('Falha ao converter arquivo em base64.'))
+  return withLoading(async () => {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader()
+      reader.onload = () => {
+        if (typeof reader.result === 'string') {
+          resolve(reader.result)
+        } else {
+          reject(new Error('Falha ao converter arquivo em base64.'))
+        }
       }
-    }
-    reader.onerror = () => reject(new Error('Falha ao ler arquivo.'))
-    reader.readAsDataURL(file)
+      reader.onerror = () => reject(new Error('Falha ao ler arquivo.'))
+      reader.readAsDataURL(file)
+    })
   })
 }
 
 async function addImageLayer(url: string, name = 'Imagem'): Promise<void> {
-  const image = await FabricImage.fromURL(url)
+  return withLoading(async () => {
+    const image = await FabricImage.fromURL(url)
 
-  const maxWidth = CARD_WIDTH * 0.62
-  const maxHeight = CARD_HEIGHT * 0.62
-  const baseW = image.width ?? 1
-  const baseH = image.height ?? 1
-  const scale = Math.min(maxWidth / baseW, maxHeight / baseH, 1)
+    const maxWidth = CARD_WIDTH * 0.62
+    const maxHeight = CARD_HEIGHT * 0.62
+    const baseW = image.width ?? 1
+    const baseH = image.height ?? 1
+    const scale = Math.min(maxWidth / baseW, maxHeight / baseH, 1)
 
-  image.set({
-    left: CARD_WIDTH * 0.5,
-    top: CARD_HEIGHT * 0.5,
-    originX: 'center',
-    originY: 'center',
-    scaleX: scale,
-    scaleY: scale,
+    image.set({
+      left: CARD_WIDTH * 0.5,
+      top: CARD_HEIGHT * 0.5,
+      originX: 'center',
+      originY: 'center',
+      scaleX: scale,
+      scaleY: scale,
+    })
+
+    setLayerMeta(image, {
+      id: generateLayerId(),
+      kind: 'image',
+      name,
+      scope: activeEditMode,
+    })
+
+    applyRuntimeConfig(image)
+    canvas.add(image)
+    canvas.setActiveObject(image)
+    refreshLayerIndex()
+    renderLayersAccordion()
+    persistActiveDeckDocument()
+    canvas.requestRenderAll()
   })
-
-  setLayerMeta(image, {
-    id: generateLayerId(),
-    kind: 'image',
-    name,
-    scope: activeEditMode,
-  })
-
-  applyRuntimeConfig(image)
-  canvas.add(image)
-  canvas.setActiveObject(image)
-  refreshLayerIndex()
-  renderLayersAccordion()
-  persistActiveDeckDocument()
-  canvas.requestRenderAll()
 }
 
 async function addGraphicReferenceLayer(name = 'Referência gráfica'): Promise<void> {
-  const svg = encodeURIComponent(`
-    <svg xmlns="http://www.w3.org/2000/svg" width="360" height="480" viewBox="0 0 360 480">
-      <rect x="4" y="4" width="352" height="472" rx="18" fill="#fff7e2" stroke="#b3833a" stroke-width="4" stroke-dasharray="14 10"/>
-      <rect x="34" y="34" width="292" height="292" rx="16" fill="#f4e5c4" opacity="0.85"/>
-      <text x="180" y="382" font-family="Arial, sans-serif" font-size="26" text-anchor="middle" fill="#7f6647">Ilustração</text>
-      <text x="180" y="414" font-family="Arial, sans-serif" font-size="18" text-anchor="middle" fill="#7f6647">carregue uma imagem</text>
-    </svg>
-  `)
-  const reference = await FabricImage.fromURL(`data:image/svg+xml;charset=utf-8,${svg}`)
+  return withLoading(async () => {
+    const svg = encodeURIComponent(`
+      <svg xmlns="http://www.w3.org/2000/svg" width="360" height="480" viewBox="0 0 360 480">
+        <rect x="4" y="4" width="352" height="472" rx="18" fill="#fff7e2" stroke="#b3833a" stroke-width="4" stroke-dasharray="14 10"/>
+        <rect x="34" y="34" width="292" height="292" rx="16" fill="#f4e5c4" opacity="0.85"/>
+        <text x="180" y="382" font-family="Arial, sans-serif" font-size="26" text-anchor="middle" fill="#7f6647">Ilustração</text>
+        <text x="180" y="414" font-family="Arial, sans-serif" font-size="18" text-anchor="middle" fill="#7f6647">carregue uma imagem</text>
+      </svg>
+    `)
+    const reference = await FabricImage.fromURL(`data:image/svg+xml;charset=utf-8,${svg}`)
 
-  reference.set({
-    left: CARD_WIDTH * 0.5,
-    top: CARD_HEIGHT * 0.45,
-    originX: 'center',
-    originY: 'center',
-    scaleX: 1,
-    scaleY: 1,
+    reference.set({
+      left: CARD_WIDTH * 0.5,
+      top: CARD_HEIGHT * 0.45,
+      originX: 'center',
+      originY: 'center',
+      scaleX: 1,
+      scaleY: 1,
+    })
+
+    setLayerMeta(reference, {
+      id: generateLayerId(),
+      kind: 'image',
+      name,
+      scope: activeEditMode,
+      fit: 'fill',
+      slotWidth: 360,
+      slotHeight: 480,
+    })
+
+    applyRuntimeConfig(reference)
+    canvas.add(reference)
+    canvas.setActiveObject(reference)
+    refreshLayerIndex()
+    renderLayersAccordion()
+    persistActiveDeckDocument()
+    canvas.requestRenderAll()
   })
-
-  setLayerMeta(reference, {
-    id: generateLayerId(),
-    kind: 'image',
-    name,
-    scope: activeEditMode,
-    fit: 'fill',
-    slotWidth: 360,
-    slotHeight: 480,
-  })
-
-  applyRuntimeConfig(reference)
-  canvas.add(reference)
-  canvas.setActiveObject(reference)
-  refreshLayerIndex()
-  renderLayersAccordion()
-  persistActiveDeckDocument()
-  canvas.requestRenderAll()
 }
 
 function addTextLayer(): void {
@@ -3240,72 +3452,76 @@ function addTextLayer(): void {
 }
 
 async function ensureBaseLayer(url?: string): Promise<void> {
-  if (!url) {
-    return
-  }
+  return withLoading(async () => {
+    if (!url) {
+      return
+    }
 
-  const baseImage = await FabricImage.fromURL(url)
+    const baseImage = await FabricImage.fromURL(url)
 
-  const imageWidth = baseImage.width ?? CARD_WIDTH
-  const imageHeight = baseImage.height ?? CARD_HEIGHT
+    const imageWidth = baseImage.width ?? CARD_WIDTH
+    const imageHeight = baseImage.height ?? CARD_HEIGHT
 
-  baseImage.set({
-    left: 0,
-    top: 0,
-    originX: 'left',
-    originY: 'top',
-    scaleX: CARD_WIDTH / imageWidth,
-    scaleY: CARD_HEIGHT / imageHeight,
+    baseImage.set({
+      left: 0,
+      top: 0,
+      originX: 'left',
+      originY: 'top',
+      scaleX: CARD_WIDTH / imageWidth,
+      scaleY: CARD_HEIGHT / imageHeight,
+    })
+
+    baseLayerId = generateLayerId()
+    setLayerMeta(baseImage, {
+      id: baseLayerId,
+      kind: 'base',
+      name: 'Carta base',
+      scope: activeEditMode === 'back' ? 'back' : 'model',
+    })
+
+    applyRuntimeConfig(baseImage)
+    canvas.add(baseImage)
+    canvas.bringObjectToFront(baseImage)
+    refreshLayerIndex()
+    renderLayersAccordion()
+    persistActiveDeckDocument()
+    canvas.requestRenderAll()
   })
-
-  baseLayerId = generateLayerId()
-  setLayerMeta(baseImage, {
-    id: baseLayerId,
-    kind: 'base',
-    name: 'Carta base',
-    scope: 'model',
-  })
-
-  applyRuntimeConfig(baseImage)
-  canvas.add(baseImage)
-  canvas.bringObjectToFront(baseImage)
-  refreshLayerIndex()
-  renderLayersAccordion()
-  persistActiveDeckDocument()
-  canvas.requestRenderAll()
 }
 
 async function replaceBaseLayer(url: string): Promise<void> {
-  let baseObject = getBaseLayerObject()
+  return withLoading(async () => {
+    let baseObject = getBaseLayerObject()
 
-  if (!baseObject) {
-    await ensureBaseLayer(url)
-    baseObject = getBaseLayerObject()
     if (!baseObject) {
-      throw new Error('Nao foi possivel preparar a layer base da carta.')
+      await ensureBaseLayer(url)
+      baseObject = getBaseLayerObject()
+      if (!baseObject) {
+        throw new Error('Nao foi possivel preparar a layer base da carta.')
+      }
+    } else {
+      await baseObject.setSrc(url)
     }
-  } else {
-    await baseObject.setSrc(url)
-  }
 
-  const imageWidth = baseObject.width ?? CARD_WIDTH
-  const imageHeight = baseObject.height ?? CARD_HEIGHT
+    const imageWidth = baseObject.width ?? CARD_WIDTH
+    const imageHeight = baseObject.height ?? CARD_HEIGHT
 
-  baseObject.set({
-    left: 0,
-    top: 0,
-    originX: 'left',
-    originY: 'top',
-    scaleX: CARD_WIDTH / imageWidth,
-    scaleY: CARD_HEIGHT / imageHeight,
+    baseObject.set({
+      left: 0,
+      top: 0,
+      originX: 'left',
+      originY: 'top',
+      scaleX: CARD_WIDTH / imageWidth,
+      scaleY: CARD_HEIGHT / imageHeight,
+    })
+
+    applyRuntimeConfig(baseObject)
+    baseObject.setCoords()
+    refreshLayerIndex()
+    renderLayersAccordion()
+    persistActiveDeckDocument()
+    canvas.requestRenderAll()
   })
-
-  applyRuntimeConfig(baseObject)
-  baseObject.setCoords()
-  refreshLayerIndex()
-  renderLayersAccordion()
-  persistActiveDeckDocument()
-  canvas.requestRenderAll()
 }
 
 function addNewCard(): void {
@@ -3333,49 +3549,63 @@ function selectCard(cardId: string): void {
   renderCardThumbnails()
 }
 
-function saveActiveDeckAsFile(): void {
-  const snapshot = deckFileSnapshot()
-  const filename = `${slugifyFilename(snapshot.deck.name)}.deck`
-  void compressTextToBlob(JSON.stringify(snapshot)).then((blob) => {
-    downloadBlob(filename, blob)
-  })
+async function saveActiveDeckAsFile(): Promise<void> {
+  try {
+    await withLoading(async () => {
+      syncDeckFilename()
+      const snapshot = deckFileSnapshot()
+      const filename = `${snapshot.deck.name}.deck`
+      const blob = await compressTextToBlob(JSON.stringify(snapshot))
+      downloadBlob(filename, blob)
+    })
+  } catch (error) {
+    window.alert(error instanceof Error ? error.message : 'Falha ao salvar baralho.')
+  }
 }
 
 async function importDeckFile(file: File): Promise<void> {
-  const rawText = await decompressDeckText(file)
-  const parsed = JSON.parse(rawText) as Record<string, unknown>
+  return withLoading(async () => {
+    const rawText = await decompressDeckText(file)
+    const parsed = JSON.parse(rawText) as Record<string, unknown>
 
-  let rawDeck: Record<string, unknown> | null = null
+    let rawDeck: Record<string, unknown> | null = null
 
-  if (parsed['version'] === 1 && parsed['deck']) {
-    rawDeck = { ...(parsed['deck'] as Record<string, unknown>) }
-    if (!rawDeck['name']) rawDeck['name'] = file.name.replace(/\.deck$/i, '') || DEFAULT_DECK_NAME
-  } else if (parsed['canvas'] || parsed['modelCanvas']) {
-    rawDeck = { ...parsed }
-    if (!rawDeck['name']) rawDeck['name'] = file.name.replace(/\.deck$/i, '') || DEFAULT_DECK_NAME
-  }
+    if (parsed['version'] === 1 && parsed['deck']) {
+      rawDeck = { ...(parsed['deck'] as Record<string, unknown>) }
+      if (!rawDeck['name']) rawDeck['name'] = file.name.replace(/\.deck$/i, '') || DEFAULT_DECK_NAME
+    } else if (parsed['canvas'] || parsed['modelCanvas']) {
+      rawDeck = { ...parsed }
+      if (!rawDeck['name']) rawDeck['name'] = file.name.replace(/\.deck$/i, '') || DEFAULT_DECK_NAME
+    }
 
-  if (!rawDeck) throw new Error('Arquivo .deck inválido.')
+    if (!rawDeck) throw new Error('Arquivo .deck inválido.')
 
-  const deck = migrateDeckDocument({ ...rawDeck, id: generateDeckId() })
-  deckDocuments = [deck]
-  activeDeckId = deck.id
-  activeEditMode = 'deck'
-  await loadActiveDeckCard(deck)
-  await refreshDeckThumbnails(deck)
-  renderWorkspaceSidebar()
+    const deck = migrateDeckDocument({
+      ...rawDeck,
+      id: generateDeckId(),
+      name: file.name.replace(/\.[^.]+$/, '') || DEFAULT_DECK_NAME,
+    })
+    deckDocuments = [deck]
+    activeDeckId = deck.id
+    activeEditMode = 'deck'
+    await loadActiveDeckCard(deck)
+    await refreshDeckThumbnails(deck)
+    renderWorkspaceSidebar()
+  })
 }
 
-function exportCanvasPng(): void {
-  const imageData = canvas.toDataURL({
-    format: 'png',
-    multiplier: 2,
-  })
+async function exportCanvasPng(): Promise<void> {
+  return withLoading(async () => {
+    const imageData = canvas.toDataURL({
+      format: 'png',
+      multiplier: 2,
+    })
 
-  const anchor = document.createElement('a')
-  anchor.href = imageData
-  anchor.download = `${buildExportFilename()}.png`
-  anchor.click()
+    const anchor = document.createElement('a')
+    anchor.href = imageData
+    anchor.download = `${buildExportFilename()}.png`
+    anchor.click()
+  })
 }
 
 function presetByKey(list: SizePreset[], key: string): SizePreset | null {
@@ -3469,128 +3699,122 @@ async function captureDeckCardPrintImage(deck: DeckDocument, cardId: string): Pr
   return thumbnailCanvas.toDataURL({ format: 'png', multiplier: 1 })
 }
 
+async function captureDeckBackPrintImage(deck: DeckDocument): Promise<string> {
+  thumbnailCanvas.clear()
+  await thumbnailCanvas.loadFromJSON(deck.backCanvas)
+  thumbnailCanvas.setViewportTransform([1, 0, 0, 1, 0, 0])
+  thumbnailCanvas.requestRenderAll()
+  return thumbnailCanvas.toDataURL({ format: 'png', multiplier: 1 })
+}
+
 async function generateDeckPrintSheets(downloadFormat: 'zip' | 'pdf'): Promise<void> {
-  const deck = currentDeck()
-  if (deck.cards.length === 0) {
-    window.alert('Nao ha cartas no baralho para gerar baralho.')
-    return
-  }
+  return withLoading(async () => {
+    const deck = currentDeck()
+    if (deck.cards.length === 0) {
+      window.alert('Nao ha cartas no baralho para gerar baralho.')
+      return
+    }
 
-  const layout = currentPrintLayout()
-  if (layout.perSheet <= 0) {
-    window.alert('Configuracao de baralho invalida.')
-    return
-  }
+    const layout = currentPrintLayout()
+    if (layout.perSheet <= 0) {
+      window.alert('Configuracao de baralho invalida.')
+      return
+    }
 
-  const previousPdfText = generateDeckPrintPdfButton.textContent
-  const previousZipText = generateDeckPrintZipButton.textContent
-  generateDeckPrintZipButton.disabled = true
-  generateDeckPrintPdfButton.disabled = true
-  if (downloadFormat === 'pdf') {
-    generateDeckPrintPdfButton.textContent = 'Gerando PDF...'
-  } else {
-    generateDeckPrintZipButton.textContent = 'Gerando ZIP...'
-  }
+    const previousPdfText = generateDeckPrintPdfButton.textContent
+    const previousZipText = generateDeckPrintZipButton.textContent
+    generateDeckPrintZipButton.disabled = true
+    generateDeckPrintPdfButton.disabled = true
+    if (downloadFormat === 'pdf') {
+      generateDeckPrintPdfButton.textContent = 'Gerando PDF...'
+    } else {
+      generateDeckPrintZipButton.textContent = 'Gerando ZIP...'
+    }
 
-  try {
-    const cardImages = await Promise.all(
-      deck.cards.map(async (card) => captureDeckCardPrintImage(deck, card.id)),
-    )
-    const imageElements = await Promise.all(cardImages.map(async (src) => loadImageElement(src)))
+    try {
+      const cardImages = await Promise.all(
+        deck.cards.map(async (card) => captureDeckCardPrintImage(deck, card.id)),
+      )
+      const imageElements = await Promise.all(cardImages.map(async (src) => loadImageElement(src)))
+      const backImage = await loadImageElement(await captureDeckBackPrintImage(deck))
 
-    const totalPages = Math.ceil(deck.cards.length / layout.perSheet)
-    const paperWidthPx = mmToPx(layout.paper.widthMm)
-    const paperHeightPx = mmToPx(layout.paper.heightMm)
-    const cardWidthPx = mmToPx(layout.card.widthMm)
-    const cardHeightPx = mmToPx(layout.card.heightMm)
-    const gapPx = mmToPx(layout.gapMm)
-    const marginPx = mmToPx(layout.sideMarginMm)
-    const baseName = slugifyFilename(deck.name)
-    const zip = downloadFormat === 'zip' ? new JSZip() : null
-    const pdf = downloadFormat === 'pdf'
-      ? new jsPDF({
-        orientation: layout.paper.widthMm > layout.paper.heightMm ? 'landscape' : 'portrait',
-        unit: 'mm',
-        format: [layout.paper.widthMm, layout.paper.heightMm],
-        compress: true,
-      })
-      : null
+      const totalPages = Math.ceil(deck.cards.length / layout.perSheet)
+      const paperWidthPx = mmToPx(layout.paper.widthMm)
+      const paperHeightPx = mmToPx(layout.paper.heightMm)
+      const cardWidthPx = mmToPx(layout.card.widthMm)
+      const cardHeightPx = mmToPx(layout.card.heightMm)
+      const gapPx = mmToPx(layout.gapMm)
+      const marginPx = mmToPx(layout.sideMarginMm)
+      const baseName = slugifyFilename(deck.name)
+      const zip = downloadFormat === 'zip' ? new JSZip() : null
+      const pdf = downloadFormat === 'pdf'
+        ? new jsPDF({
+          orientation: layout.paper.widthMm > layout.paper.heightMm ? 'landscape' : 'portrait',
+          unit: 'mm',
+          format: [layout.paper.widthMm, layout.paper.heightMm],
+          compress: true,
+        })
+        : null
 
-    for (let pageIndex = 0; pageIndex < totalPages; pageIndex += 1) {
-      const sheetCanvas = document.createElement('canvas')
-      sheetCanvas.width = paperWidthPx
-      sheetCanvas.height = paperHeightPx
-      const context = sheetCanvas.getContext('2d')
-      if (!context) {
-        throw new Error('Falha ao preparar canvas de impressao.')
-      }
+      for (let pageIndex = 0; pageIndex < totalPages; pageIndex += 1) {
+        for (const side of ['frente', 'verso'] as const) {
+          const sheetCanvas = document.createElement('canvas')
+          sheetCanvas.width = paperWidthPx
+          sheetCanvas.height = paperHeightPx
+          const context = sheetCanvas.getContext('2d')
+          if (!context) throw new Error('Falha ao preparar canvas de impressao.')
 
-      context.fillStyle = '#ffffff'
-      context.fillRect(0, 0, paperWidthPx, paperHeightPx)
+          context.fillStyle = '#ffffff'
+          context.fillRect(0, 0, paperWidthPx, paperHeightPx)
 
-      for (let slot = 0; slot < layout.perSheet; slot += 1) {
-        const cardIndex = pageIndex * layout.perSheet + slot
-        if (cardIndex >= cardImages.length) {
-          break
+          for (let slot = 0; slot < layout.perSheet; slot += 1) {
+            const cardIndex = pageIndex * layout.perSheet + slot
+            if (cardIndex >= cardImages.length) break
+
+            const row = Math.floor(slot / layout.columns)
+            const frontCol = slot % layout.columns
+            const col = side === 'verso' ? layout.columns - 1 - frontCol : frontCol
+            const x = marginPx + col * (cardWidthPx + gapPx)
+            const y = marginPx + row * (cardHeightPx + gapPx)
+            context.drawImage(side === 'verso' ? backImage : imageElements[cardIndex], x, y, cardWidthPx, cardHeightPx)
+          }
+
+          if (downloadFormat === 'zip' && zip) {
+            const blob = await canvasToBlob(sheetCanvas)
+            zip.file(`${baseName}-${String(pageIndex + 1).padStart(2, '0')}-${side}.png`, blob)
+          }
+
+          if (downloadFormat === 'pdf' && pdf) {
+            if (pageIndex > 0 || side === 'verso') pdf.addPage()
+            pdf.addImage(sheetCanvas.toDataURL('image/png'), 'PNG', 0, 0, layout.paper.widthMm, layout.paper.heightMm, undefined, 'FAST')
+          }
         }
-
-        const row = Math.floor(slot / layout.columns)
-        const col = slot % layout.columns
-        const x = marginPx + col * (cardWidthPx + gapPx)
-        const y = marginPx + row * (cardHeightPx + gapPx)
-        const image = imageElements[cardIndex]
-        context.drawImage(image, x, y, cardWidthPx, cardHeightPx)
       }
 
       if (downloadFormat === 'zip' && zip) {
-        const blob = await canvasToBlob(sheetCanvas)
-        const fileName = totalPages === 1
-          ? `${baseName}-impressao.png`
-          : `${baseName}-impressao-${String(pageIndex + 1).padStart(2, '0')}.png`
-        zip.file(fileName, blob)
+        const zipBlob = await zip.generateAsync({
+          type: 'blob',
+          compression: 'DEFLATE',
+          compressionOptions: { level: 9 },
+        })
+        downloadBlob(`${baseName}-impressao.zip`, zipBlob)
       }
 
       if (downloadFormat === 'pdf' && pdf) {
-        if (pageIndex > 0) {
-          pdf.addPage()
-        }
-        const imageData = sheetCanvas.toDataURL('image/png')
-        pdf.addImage(
-          imageData,
-          'PNG',
-          0,
-          0,
-          layout.paper.widthMm,
-          layout.paper.heightMm,
-          undefined,
-          'FAST',
-        )
+        const pdfBlob = pdf.output('blob')
+        downloadBlob(`${baseName}-impressao.pdf`, pdfBlob)
       }
-    }
 
-    if (downloadFormat === 'zip' && zip) {
-      const zipBlob = await zip.generateAsync({
-        type: 'blob',
-        compression: 'DEFLATE',
-        compressionOptions: { level: 9 },
-      })
-      downloadBlob(`${baseName}-impressao.zip`, zipBlob)
+      closePrintModal()
+    } catch (error) {
+      window.alert(error instanceof Error ? error.message : 'Falha ao gerar folhas de impressao.')
+    } finally {
+      generateDeckPrintZipButton.disabled = false
+      generateDeckPrintPdfButton.disabled = false
+      generateDeckPrintPdfButton.textContent = previousPdfText
+      generateDeckPrintZipButton.textContent = previousZipText
     }
-
-    if (downloadFormat === 'pdf' && pdf) {
-      const pdfBlob = pdf.output('blob')
-      downloadBlob(`${baseName}-impressao.pdf`, pdfBlob)
-    }
-
-    closePrintModal()
-  } catch (error) {
-    window.alert(error instanceof Error ? error.message : 'Falha ao gerar folhas de impressao.')
-  } finally {
-    generateDeckPrintZipButton.disabled = false
-    generateDeckPrintPdfButton.disabled = false
-    generateDeckPrintPdfButton.textContent = previousPdfText
-    generateDeckPrintZipButton.textContent = previousZipText
-  }
+  })
 }
 
 function updatePrintPreview(): void {
@@ -3696,6 +3920,19 @@ editSelectionButton.addEventListener('click', () => {
   renderWorkspaceTabs()
 })
 exportDeckButton.addEventListener('click', saveActiveDeckAsFile)
+deckNameInput.addEventListener('input', () => {
+  currentDeck().name = deckNameInput.value
+})
+
+editBackButton.addEventListener('click', () => {
+  if (activeEditMode === 'back') {
+    activeRightPanelTab = 'model-layers'
+    renderWorkspaceTabs()
+    return
+  }
+  void switchToBackView()
+})
+deckNameInput.addEventListener('change', syncDeckFilename)
 
 importDeckButton.addEventListener('click', () => {
   importDeckInput.click()
@@ -3719,7 +3956,7 @@ importDeckInput.addEventListener('change', async () => {
 addCardButton.addEventListener('click', addNewCard)
 
 addGraphicButton.addEventListener('click', () => {
-  if (activeEditMode !== 'model') {
+  if (activeEditMode === 'deck') {
     window.alert('No modo Baralho, edite apenas os layers existentes da carta.')
     return
   }
@@ -3727,7 +3964,7 @@ addGraphicButton.addEventListener('click', () => {
 })
 
 addTextButton.addEventListener('click', () => {
-  if (activeEditMode !== 'model') {
+  if (activeEditMode === 'deck') {
     window.alert('No modo Baralho, edite apenas os textos ja existentes da carta.')
     return
   }
@@ -3831,6 +4068,14 @@ zoomFitButton.addEventListener('click', () => {
   fitCanvasZoomToStage()
 })
 
+canvasPanel.addEventListener('wheel', (event) => {
+  if (!event.ctrlKey) return
+
+  event.preventDefault()
+  const direction = event.deltaY < 0 ? 1 : -1
+  setCanvasZoom(currentZoom() + direction * ZOOM_STEP)
+}, { passive: false })
+
 window.addEventListener('keydown', (event) => {
   if (isEditingField(event.target)) {
     return
@@ -3857,7 +4102,7 @@ window.addEventListener('keydown', (event) => {
 
 canvas.on('selection:created', () => {
   if (!suppressSelectionSync) {
-    if (activeEditMode === 'model') {
+    if (activeEditMode !== 'deck') {
       renderLayersAccordion()
       return
     }
@@ -3870,7 +4115,7 @@ canvas.on('selection:created', () => {
 
 canvas.on('selection:updated', () => {
   if (!suppressSelectionSync) {
-    if (activeEditMode === 'model') {
+    if (activeEditMode !== 'deck') {
       renderLayersAccordion()
       return
     }
@@ -3883,7 +4128,7 @@ canvas.on('selection:updated', () => {
 
 canvas.on('selection:cleared', () => {
   if (!suppressSelectionSync) {
-    if (activeEditMode === 'model') {
+    if (activeEditMode !== 'deck') {
       renderLayersAccordion()
       return
     }
@@ -3901,7 +4146,7 @@ canvas.on('object:modified', (e) => {
       setLayerMeta(obj, { ...meta, slotWidth: Math.max(1, obj.getScaledWidth()), slotHeight: Math.max(1, obj.getScaledHeight()) })
     }
   }
-  if (activeEditMode === 'model') {
+  if (activeEditMode !== 'deck') {
     renderLayersAccordion()
   } else {
     renderWorkspaceTabs()
