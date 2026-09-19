@@ -834,6 +834,27 @@ button.tiny {
   align-items: center;
 }
 
+.text-style-controls {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 6px;
+}
+
+.text-style-option {
+  flex-direction: row;
+  align-items: center;
+  gap: 7px;
+  margin: 0;
+  padding: 8px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--panel), var(--accent) 4%);
+  cursor: pointer;
+  font-size: 0.78rem;
+}
+
+.text-style-option input { margin: 0; }
+
 .saved-color-palette {
   display: grid;
   grid-template-columns: repeat(5, minmax(42px, 1fr));

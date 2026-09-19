@@ -3270,6 +3270,49 @@ function renderLayersAccordion(): void {
       })
       body.append(detailsRow('Espacamento de linha', lineHeightField))
 
+      const textStyleControls = document.createElement('div')
+      textStyleControls.className = 'text-style-controls'
+      ;[
+        {
+          label: 'Negrito',
+          checked: String((textObject as any).fontWeight ?? '').toLowerCase() === 'bold' || Number((textObject as any).fontWeight) >= 600,
+          apply: (enabled: boolean) => textObject.set({ fontWeight: enabled ? 'bold' : 'normal' }),
+        },
+        {
+          label: 'Itálico',
+          checked: String((textObject as any).fontStyle ?? '').toLowerCase() === 'italic',
+          apply: (enabled: boolean) => textObject.set({ fontStyle: enabled ? 'italic' : 'normal' }),
+        },
+        {
+          label: 'Sublinhado',
+          checked: Boolean((textObject as any).underline),
+          apply: (enabled: boolean) => textObject.set({ underline: enabled }),
+        },
+        {
+          label: 'Tachado',
+          checked: Boolean((textObject as any).linethrough),
+          apply: (enabled: boolean) => textObject.set({ linethrough: enabled }),
+        },
+      ].forEach((style) => {
+        const label = document.createElement('label')
+        label.className = 'text-style-option'
+        const field = document.createElement('input')
+        field.type = 'checkbox'
+        field.checked = style.checked
+        attachNoDragPropagation(field)
+        field.addEventListener('change', () => {
+          style.apply(field.checked)
+          textObject.setCoords()
+          canvas.requestRenderAll()
+          persistActiveDeckDocument()
+        })
+        const caption = document.createElement('span')
+        caption.textContent = style.label
+        label.append(field, caption)
+        textStyleControls.append(label)
+      })
+      body.append(detailsRow('Estilo padrão', textStyleControls))
+
       const rawShadow = (textObject as any).shadow as
         | { color?: string; blur?: number; offsetX?: number; offsetY?: number }
         | null
