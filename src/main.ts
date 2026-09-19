@@ -1489,7 +1489,7 @@ function deckFileSnapshot(): { version: 1; deck: DeckDocument } {
 }
 
 app.innerHTML = `
-<main class="editor-layout">
+<main id="editorWorkspace" class="editor-layout">
   <section class="panel tools-panel">
     <div class="menu-shell">
       <div class="menu-top">
@@ -1514,6 +1514,10 @@ app.innerHTML = `
         <button id="exportDeckButton" class="menu-item" type="button">
           <span class="material-symbols-outlined" aria-hidden="true">save</span>
           <span>Salvar .deck</span>
+        </button>
+        <button id="openTutorialButton" class="menu-item" type="button">
+          <span class="material-symbols-outlined" aria-hidden="true">school</span>
+          <span>Como usar</span>
         </button>
       </nav>
 
@@ -1599,6 +1603,61 @@ app.innerHTML = `
     </section>
   </div>
 </main>
+
+<section id="tutorialSection" class="tutorial-section" aria-labelledby="tutorialTitle">
+  <div class="tutorial-shell">
+    <header class="tutorial-hero">
+      <div>
+        <span class="tutorial-eyebrow">GUIA RÁPIDO • DECK STUDIO</span>
+        <h2 id="tutorialTitle">Da primeira ideia ao baralho impresso</h2>
+        <p>Aprenda o fluxo essencial do editor e monte cartas consistentes sem precisar começar do zero.</p>
+      </div>
+      <span class="material-symbols-outlined tutorial-hero-icon" aria-hidden="true">auto_stories</span>
+    </header>
+
+    <div class="tutorial-steps">
+      <article class="tutorial-step">
+        <span class="tutorial-step-number">01</span>
+        <div><h3>Escolha um modelo</h3><p>Clique em <strong>Modelos prontos</strong>, compare as composições e aplique a que combina com seu jogo. O modelo define a estrutura usada por todas as cartas.</p></div>
+      </article>
+      <article class="tutorial-step">
+        <span class="tutorial-step-number">02</span>
+        <div><h3>Ajuste a estrutura</h3><p>Na aba <strong>Modelo</strong>, selecione os layers para mover, redimensionar ou reordenar título, ilustração, tipo, descrição e atributos.</p></div>
+      </article>
+      <article class="tutorial-step">
+        <span class="tutorial-step-number">03</span>
+        <div><h3>Personalize cada carta</h3><p>Volte para <strong>Baralho</strong>, escolha uma miniatura e edite o conteúdo. Dê duplo clique na ilustração para substituí-la sem alterar seu encaixe.</p></div>
+      </article>
+      <article class="tutorial-step">
+        <span class="tutorial-step-number">04</span>
+        <div><h3>Crie variações</h3><p>Use <strong>Adicionar carta</strong> para gerar novas cartas com o mesmo modelo. Textos e imagens podem ser diferentes em cada uma.</p></div>
+      </article>
+      <article class="tutorial-step">
+        <span class="tutorial-step-number">05</span>
+        <div><h3>Prepare o verso</h3><p>Abra a aba <strong>Verso</strong> para criar a arte comum do baralho. Você pode enviar uma imagem base e adicionar outros elementos por cima.</p></div>
+      </article>
+      <article class="tutorial-step">
+        <span class="tutorial-step-number">06</span>
+        <div><h3>Salve e exporte</h3><p>Salve o projeto em <strong>.deck</strong> para continuar depois. Exporte uma carta individual ou use <strong>Gerar baralho</strong> para produzir PDF ou ZIP.</p></div>
+      </article>
+    </div>
+
+    <div class="tutorial-tips">
+      <h3><span class="material-symbols-outlined" aria-hidden="true">lightbulb</span> Dicas úteis</h3>
+      <ul>
+        <li>Use o controle de zoom ou mantenha <kbd>Ctrl</kbd> pressionado e mova a roda do mouse.</li>
+        <li>Arraste imagens diretamente para a área da carta.</li>
+        <li>Use as setas do teclado para ajustes finos e <kbd>Delete</kbd> para remover o layer selecionado.</li>
+        <li>Antes de imprimir, confira o tamanho da carta, o papel, o espaçamento e a opção de verso.</li>
+      </ul>
+    </div>
+  </div>
+</section>
+
+<button id="backToEditorButton" class="back-to-editor" type="button" aria-label="Voltar ao editor" aria-hidden="true" tabindex="-1">
+  <span class="material-symbols-outlined" aria-hidden="true">arrow_upward</span>
+  <span>Voltar ao editor</span>
+</button>
 
 <div id="printModal" class="print-modal" hidden>
   <div id="printModalBackdrop" class="print-modal-backdrop"></div>
@@ -1769,8 +1828,34 @@ const templatesModal = requireElement<HTMLDivElement>(app, '#templatesModal')
 const templatesModalBackdrop = requireElement<HTMLDivElement>(app, '#templatesModalBackdrop')
 const closeTemplatesModalButton = requireElement<HTMLButtonElement>(app, '#closeTemplatesModalButton')
 const templatesGrid = requireElement<HTMLDivElement>(app, '#templatesGrid')
+const editorWorkspace = requireElement<HTMLElement>(app, '#editorWorkspace')
+const openTutorialButton = requireElement<HTMLButtonElement>(app, '#openTutorialButton')
+const tutorialSection = requireElement<HTMLElement>(app, '#tutorialSection')
+const backToEditorButton = requireElement<HTMLButtonElement>(app, '#backToEditorButton')
 
 const PANEL_WIDTHS_STORAGE_KEY = 'deckstudio.panel-widths'
+
+function preferredScrollBehavior(): ScrollBehavior {
+  return window.matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth'
+}
+
+function syncBackToEditorButton(): void {
+  const tutorialBounds = tutorialSection.getBoundingClientRect()
+  const tutorialVisible = tutorialBounds.top < window.innerHeight * 0.72 && tutorialBounds.bottom > 0
+  backToEditorButton.classList.toggle('is-visible', tutorialVisible)
+  backToEditorButton.setAttribute('aria-hidden', String(!tutorialVisible))
+  backToEditorButton.tabIndex = tutorialVisible ? 0 : -1
+}
+
+openTutorialButton.addEventListener('click', () => {
+  tutorialSection.scrollIntoView({ behavior: preferredScrollBehavior(), block: 'start' })
+})
+
+backToEditorButton.addEventListener('click', () => {
+  editorWorkspace.scrollIntoView({ behavior: preferredScrollBehavior(), block: 'start' })
+})
+
+window.addEventListener('scroll', syncBackToEditorButton, { passive: true })
 
 function setPanelWidths(left: number, right: number): void {
   editorLayout.style.setProperty('--left-panel-width', `${left}px`)
@@ -4519,11 +4604,13 @@ canvas.on('object:added', (event) => {
 
 window.addEventListener('resize', () => {
   fitCanvasZoomToStage()
+  syncBackToEditorButton()
 })
 
 attachCanvasDnD()
 renderWorkspaceSidebar()
 syncModeControls()
+syncBackToEditorButton()
 void loadActiveDeckCard(currentDeck()).then(async () => {
   await refreshDeckThumbnails(currentDeck())
 })
