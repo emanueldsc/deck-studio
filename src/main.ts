@@ -129,6 +129,71 @@ const SAVED_TEXT_COLORS_KEY = 'deckstudio.saved-text-styles-v2'
 const DEFAULT_SAVED_TEXT_COLORS = ['#cd7f32', '#a8a9ad', '#d4a017', '#2f9e44', '#1971c2']
 const DEFAULT_SAVED_TEXT_FOREGROUNDS = ['#ffffff', '#111111', '#111111', '#ffffff', '#ffffff']
 
+interface CardTemplatePreset {
+  id: string
+  name: string
+  family: string
+  description: string
+  colors: [string, string, string, string]
+  title: string
+  typeLine: string
+  rules: string
+  stats: string
+  ornament: 'leaves' | 'runes' | 'flames' | 'waves' | 'moon' | 'clean'
+  layout: 'classic' | 'fullbleed' | 'splitLeft' | 'landscape' | 'splitRight' | 'poster'
+}
+
+const CARD_TEMPLATE_PRESETS: CardTemplatePreset[] = [
+  {
+    id: 'bosque', name: 'Clareira do Bosque', family: 'Aventura',
+    description: 'Madeira, papel e folhas para personagens e facções.',
+    colors: ['#243c2d', '#d9c89b', '#f4ecd5', '#9b5f32'],
+    title: 'GUARDIÃO DA CLAREIRA', typeLine: 'Habitante • Protetor',
+    rules: 'Ao entrar em jogo, escolha uma clareira.\nAliados nela recebem +1 de defesa.',
+    stats: '3  ◆  5', ornament: 'leaves', layout: 'classic',
+  },
+  {
+    id: 'arcano', name: 'Relíquia Arcana', family: 'Fantasia TCG',
+    description: 'Arte em sangria total com informações flutuando sobre a cena.',
+    colors: ['#17233d', '#b18a43', '#eee2c3', '#594171'],
+    title: 'ORÁCULO DAS MARÉS', typeLine: 'Criatura • Místico',
+    rules: 'Vigilância\nQuando esta carta for revelada, compre uma carta e descarte uma carta.',
+    stats: '2 / 4', ornament: 'runes', layout: 'fullbleed',
+  },
+  {
+    id: 'forja', name: 'Coração da Forja', family: 'Batalha',
+    description: 'Arte vertical à esquerda e ficha completa à direita.',
+    colors: ['#351510', '#d26a2e', '#f2d2a0', '#721f17'],
+    title: 'FERREIRO DE CINZAS', typeLine: 'Campeão • Artesão',
+    rules: 'Investida\nSempre que atacar, cause 1 de dano a um alvo adjacente.',
+    stats: '6  /  3', ornament: 'flames', layout: 'splitLeft',
+  },
+  {
+    id: 'abissal', name: 'Maré Abissal', family: 'Místico',
+    description: 'Composição editorial com ilustração panorâmica e rodapé amplo.',
+    colors: ['#082f49', '#2b91a3', '#d8f0e9', '#164e63'],
+    title: 'NAVEGANTE DO ABISMO', typeLine: 'Explorador • Oceânico',
+    rules: 'Fluxo — Se você jogou outra carta neste turno, mova até 2 espaços.',
+    stats: '4  ◇  4', ornament: 'waves', layout: 'landscape',
+  },
+  {
+    id: 'eclipse', name: 'Corte do Eclipse', family: 'Sombrio',
+    description: 'Ficha lateral à esquerda e retrato alto à direita.',
+    colors: ['#171421', '#8a6ca8', '#e7e0ec', '#42334f'],
+    title: 'REGENTE DO ECLIPSE', typeLine: 'Lenda • Soberano',
+    rules: 'Único\nNo início da noite, coloque um marcador de presságio nesta carta.',
+    stats: '7  ✦  7', ornament: 'moon', layout: 'splitRight',
+  },
+  {
+    id: 'cronica', name: 'Crônica Essencial', family: 'Minimalista',
+    description: 'Pôster contemporâneo com imagem dominante e tipografia limpa.',
+    colors: ['#20252b', '#d6a84b', '#f5f1e8', '#6b747c'],
+    title: 'NOME DA CARTA', typeLine: 'Categoria • Subtipo',
+    rules: 'Escreva aqui o efeito da carta.\nUse este espaço para regras, custo e condições.',
+    stats: '03  /  05', ornament: 'clean', layout: 'poster',
+  },
+]
+
 interface SavedTextStyle {
   color: string
   backgroundColor: string
@@ -1429,6 +1494,10 @@ app.innerHTML = `
     <div class="menu-shell">
       <div class="menu-top">
         <h1 class="menu-brand">Deck Studio</h1>
+        <button id="openTemplatesButton" class="template-launch-button" type="button">
+          <span class="material-symbols-outlined" aria-hidden="true">style</span>
+          <span><strong>Modelos prontos</strong><small>Comece com uma carta completa</small></span>
+        </button>
         <label class="file-name-field" for="deckNameInput">
           Nome do arquivo
           <input id="deckNameInput" type="text" placeholder="Baralho 1" aria-describedby="deckNameHint" />
@@ -1590,6 +1659,15 @@ app.innerHTML = `
         <input id="printGapInput" type="number" min="0" max="30" step="1" value="3" />
       </label>
 
+      <label class="print-option-switch" for="printIncludeBackSwitch">
+        <span>
+          <span class="print-option-title">Imprimir verso das cartas</span>
+          <span class="print-option-description">Adiciona folhas de verso espelhadas para impressao frente e verso.</span>
+        </span>
+        <input id="printIncludeBackSwitch" type="checkbox" role="switch" checked />
+        <span class="theme-switch-track" aria-hidden="true"><span class="theme-switch-thumb"></span></span>
+      </label>
+
       <p id="printLayoutSummary" class="hint"></p>
 
       <div class="print-preview-wrap">
@@ -1603,6 +1681,25 @@ app.innerHTML = `
         <button id="generateDeckPrintZipButton" class="ghost" type="button">Baixar Baralho em ZIP</button>
       </div>
     </div>
+  </section>
+</div>
+
+<div id="templatesModal" class="templates-modal" hidden>
+  <div id="templatesModalBackdrop" class="templates-modal-backdrop"></div>
+  <section class="templates-modal-dialog" role="dialog" aria-modal="true" aria-labelledby="templatesModalTitle">
+    <header class="templates-modal-header">
+      <div>
+        <span class="templates-eyebrow">BIBLIOTECA DE MODELOS</span>
+        <h2 id="templatesModalTitle">Escolha um ponto de partida</h2>
+        <p>Todos os elementos continuam editáveis depois da aplicação.</p>
+      </div>
+      <button id="closeTemplatesModalButton" class="ghost tiny" type="button" aria-label="Fechar modelos">Fechar</button>
+    </header>
+    <div id="templatesGrid" class="templates-grid"></div>
+    <footer class="templates-modal-footer">
+      <span class="material-symbols-outlined" aria-hidden="true">info</span>
+      Aplicar um modelo substitui apenas o layout da frente. Suas cartas permanecem no baralho.
+    </footer>
   </section>
 </div>
 `
@@ -1638,6 +1735,7 @@ const printCardHeightInput = requireElement<HTMLInputElement>(app, '#printCardHe
 const printPaperSizeSelect = requireElement<HTMLSelectElement>(app, '#printPaperSizeSelect')
 const printOrientationSelect = requireElement<HTMLSelectElement>(app, '#printOrientationSelect')
 const printGapInput = requireElement<HTMLInputElement>(app, '#printGapInput')
+const printIncludeBackSwitch = requireElement<HTMLInputElement>(app, '#printIncludeBackSwitch')
 const printLayoutSummary = requireElement<HTMLParagraphElement>(app, '#printLayoutSummary')
 const printPreviewSheet = requireElement<HTMLDivElement>(app, '#printPreviewSheet')
 const printPreviewGrid = requireElement<HTMLDivElement>(app, '#printPreviewGrid')
@@ -1666,6 +1764,11 @@ const themeIcon = requireElement<HTMLSpanElement>(app, '#themeIcon')
 const editorLayout = requireElement<HTMLElement>(app, '.editor-layout')
 const leftPanelResizer = requireElement<HTMLDivElement>(app, '#leftPanelResizer')
 const rightPanelResizer = requireElement<HTMLDivElement>(app, '#rightPanelResizer')
+const openTemplatesButton = requireElement<HTMLButtonElement>(app, '#openTemplatesButton')
+const templatesModal = requireElement<HTMLDivElement>(app, '#templatesModal')
+const templatesModalBackdrop = requireElement<HTMLDivElement>(app, '#templatesModalBackdrop')
+const closeTemplatesModalButton = requireElement<HTMLButtonElement>(app, '#closeTemplatesModalButton')
+const templatesGrid = requireElement<HTMLDivElement>(app, '#templatesGrid')
 
 const PANEL_WIDTHS_STORAGE_KEY = 'deckstudio.panel-widths'
 
@@ -3494,6 +3597,189 @@ function addTextLayer(): void {
   canvas.requestRenderAll()
 }
 
+function svgDataUrl(svg: string): string {
+  return `data:image/svg+xml;charset=utf-8,${encodeURIComponent(svg)}`
+}
+
+function templateOrnament(preset: CardTemplatePreset): string {
+  const accent = preset.colors[1]
+  if (preset.ornament === 'leaves') return `<path d="M40 155 Q115 90 185 142 M590 155 Q515 90 445 142" fill="none" stroke="${accent}" stroke-width="8"/><path d="M86 126q-26-42-50 2q35 14 50-2m458 0q26-42 50 2q-35 14-50-2" fill="${accent}"/>`
+  if (preset.ornament === 'runes') return `<g fill="none" stroke="${accent}" stroke-width="5" opacity=".9"><circle cx="74" cy="104" r="25"/><path d="m74 72 18 32-18 32-18-32zm482 0 18 32-18 32-18-32z"/></g>`
+  if (preset.ornament === 'flames') return `<path d="M42 190Q18 125 77 72q-9 50 24 66 4-43 35-69 17 69-25 121zm546 0q24-65-35-118 9 50-24 66-4-43-35-69-17 69 25 121z" fill="${accent}" opacity=".78"/>`
+  if (preset.ornament === 'waves') return `<path d="M30 142q45-38 90 0t90 0M420 142q45-38 90 0t90 0" fill="none" stroke="${accent}" stroke-width="8" stroke-linecap="round"/>`
+  if (preset.ornament === 'moon') return `<path d="M91 68a44 44 0 1 0 30 72 38 38 0 1 1-30-72m448 0a44 44 0 1 1-30 72 38 38 0 1 0 30-72" fill="${accent}"/>`
+  return `<path d="M36 116h116M478 116h116" stroke="${accent}" stroke-width="6"/><circle cx="315" cy="70" r="9" fill="${accent}"/>`
+}
+
+function templateBaseSvg(preset: CardTemplatePreset): string {
+  const [ink, accent, paper, deep] = preset.colors
+  const defs = `<defs><linearGradient id="bg" x2="0" y2="1"><stop stop-color="${paper}"/><stop offset="1" stop-color="${accent}" stop-opacity=".32"/></linearGradient><linearGradient id="shade" x2="0" y2="1"><stop offset=".3" stop-color="${ink}" stop-opacity="0"/><stop offset="1" stop-color="${ink}" stop-opacity=".96"/></linearGradient><pattern id="grain" width="24" height="24" patternUnits="userSpaceOnUse"><path d="M0 12h24M12 0v24" stroke="${ink}" stroke-opacity=".04"/></pattern></defs>`
+  let structure = ''
+
+  if (preset.layout === 'fullbleed') {
+    structure = `<rect width="630" height="880" rx="34" fill="url(#shade)"/><rect x="13" y="13" width="604" height="854" rx="27" fill="none" stroke="${accent}" stroke-width="7"/><path d="M30 30h570v128H30z" fill="${ink}" fill-opacity=".72"/><path d="M30 620h570v230H30z" fill="${ink}" fill-opacity=".82"/><path d="M48 686h430" stroke="${accent}" stroke-width="3"/><circle cx="548" cy="795" r="48" fill="${ink}" stroke="${accent}" stroke-width="6"/>${templateOrnament(preset)}`
+  } else if (preset.layout === 'splitLeft') {
+    structure = `<rect width="630" height="880" rx="34" fill="${ink}"/><rect x="14" y="14" width="602" height="852" rx="26" fill="${paper}" stroke="${accent}" stroke-width="5"/><rect x="28" y="28" width="276" height="824" rx="18" fill="${deep}"/><path d="M318 28h284v824H318z" fill="url(#grain)"/><path d="M318 188h284" stroke="${accent}" stroke-width="5"/><path d="M318 646h284" stroke="${deep}" stroke-width="2"/><circle cx="551" cy="794" r="42" fill="${ink}" stroke="${accent}" stroke-width="5"/>`
+  } else if (preset.layout === 'splitRight') {
+    structure = `<rect width="630" height="880" rx="34" fill="${ink}"/><rect x="14" y="14" width="602" height="852" rx="26" fill="${paper}" stroke="${accent}" stroke-width="5"/><rect x="326" y="28" width="276" height="824" rx="18" fill="${deep}"/><path d="M28 28h284v824H28z" fill="url(#grain)"/><path d="M28 188h284" stroke="${accent}" stroke-width="5"/><path d="M28 646h284" stroke="${deep}" stroke-width="2"/><circle cx="82" cy="794" r="42" fill="${ink}" stroke="${accent}" stroke-width="5"/>`
+  } else if (preset.layout === 'landscape') {
+    structure = `<rect width="630" height="880" rx="34" fill="${ink}"/><rect x="14" y="14" width="602" height="852" rx="26" fill="url(#bg)" stroke="${accent}" stroke-width="5"/><path d="M34 34h562v108H34z" fill="${ink}"/><rect x="34" y="158" width="562" height="400" rx="8" fill="${deep}" stroke="${accent}" stroke-width="5"/><path d="M34 576h562v260H34z" fill="${paper}" stroke="${deep}" stroke-width="3"/><path d="M34 576h562v52H34z" fill="${deep}"/><path d="M500 628v208" stroke="${accent}" stroke-width="3"/>`
+  } else if (preset.layout === 'poster') {
+    structure = `<rect width="630" height="880" rx="34" fill="${paper}"/><rect x="14" y="14" width="602" height="852" rx="25" fill="none" stroke="${ink}" stroke-width="12"/><path d="M34 34h562v116H34z" fill="${paper}" fill-opacity=".94"/><rect x="46" y="166" width="538" height="548" fill="${deep}" stroke="${accent}" stroke-width="4"/><path d="M46 730h538v116H46z" fill="${ink}"/><rect x="46" y="714" width="538" height="16" fill="${accent}"/>`
+  } else {
+    structure = `<rect width="630" height="880" rx="34" fill="${ink}"/><rect x="13" y="13" width="604" height="854" rx="27" fill="url(#bg)" stroke="${accent}" stroke-width="5"/><rect x="26" y="26" width="578" height="828" rx="21" fill="url(#grain)" stroke="${deep}" stroke-width="3"/><path d="M39 36h552v115H39z" fill="${ink}" opacity=".96"/><rect x="48" y="169" width="534" height="390" rx="16" fill="${deep}" stroke="${accent}" stroke-width="8"/><path d="M48 585h534v202c0 19-15 34-34 34H82c-19 0-34-15-34-34z" fill="${paper}" stroke="${deep}" stroke-width="4"/><path d="M48 585h534v54H48z" fill="${deep}"/><circle cx="546" cy="818" r="45" fill="${ink}" stroke="${accent}" stroke-width="6"/><circle cx="84" cy="818" r="18" fill="${accent}"/><circle cx="121" cy="818" r="8" fill="${deep}" opacity=".65"/>${templateOrnament(preset)}`
+  }
+
+  return `<svg xmlns="http://www.w3.org/2000/svg" width="630" height="880" viewBox="0 0 630 880">
+    ${defs}${structure}
+  </svg>`
+}
+
+function templateIllustrationSvg(preset: CardTemplatePreset, width: number, height: number): string {
+  const [ink, accent, paper, deep] = preset.colors
+  return `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}" viewBox="0 0 500 700" preserveAspectRatio="xMidYMid slice">
+    <defs><linearGradient id="sky" x2="1" y2="1"><stop stop-color="${deep}"/><stop offset="1" stop-color="${ink}"/></linearGradient></defs>
+    <rect width="500" height="700" fill="url(#sky)"/>
+    <circle cx="368" cy="178" r="92" fill="${accent}" opacity=".5"/>
+    <path d="M0 580 112 350l76 116 75-211 77 182 54-94 106 237v120H0z" fill="${paper}" opacity=".2"/>
+    <path d="M0 620 126 435l74 104 93-168 74 128 54-76 79 135v142H0z" fill="${accent}" opacity=".48"/>
+    <g fill="${paper}" opacity=".9" text-anchor="middle" font-family="Arial, sans-serif"><text x="250" y="315" font-size="38" font-weight="700">SUA ARTE</text><text x="250" y="353" font-size="19">duplo clique para substituir</text></g>
+  </svg>`
+}
+
+interface TemplateLayoutSpec {
+  art: { left: number; top: number; width: number; height: number }
+  baseAboveArt?: boolean
+  title: ConstructorParameters<typeof Textbox>[1]
+  typeLine: ConstructorParameters<typeof Textbox>[1]
+  rules: ConstructorParameters<typeof Textbox>[1]
+  stats: ConstructorParameters<typeof Textbox>[1]
+}
+
+function templateLayoutSpec(preset: CardTemplatePreset): TemplateLayoutSpec {
+  const [ink, , paper, deep] = preset.colors
+  const aligned = { originX: 'left' as const, originY: 'top' as const }
+  const centered = { originX: 'center' as const, originY: 'center' as const }
+
+  if (preset.layout === 'fullbleed') return {
+    art: { left: 0, top: 0, width: 630, height: 880 }, baseAboveArt: true,
+    title: { ...aligned, left: 52, top: 62, width: 526, fontSize: 34, fill: paper, textAlign: 'left' },
+    typeLine: { ...aligned, left: 50, top: 642, width: 430, fontSize: 19, fill: paper, textAlign: 'left' },
+    rules: { ...aligned, left: 50, top: 704, width: 430, fontSize: 22, fill: paper, textAlign: 'left' },
+    stats: { ...centered, left: 548, top: 795, width: 80, fontSize: 21, fill: paper, textAlign: 'center' },
+  }
+  if (preset.layout === 'splitLeft') return {
+    art: { left: 38, top: 38, width: 256, height: 804 },
+    title: { ...aligned, left: 338, top: 64, width: 238, fontSize: 29, fill: ink, textAlign: 'left' },
+    typeLine: { ...aligned, left: 338, top: 210, width: 238, fontSize: 17, fill: deep, textAlign: 'left' },
+    rules: { ...aligned, left: 338, top: 278, width: 232, fontSize: 23, fill: ink, textAlign: 'left' },
+    stats: { ...centered, left: 551, top: 794, width: 74, fontSize: 20, fill: paper, textAlign: 'center' },
+  }
+  if (preset.layout === 'splitRight') return {
+    art: { left: 336, top: 38, width: 256, height: 804 },
+    title: { ...aligned, left: 52, top: 64, width: 238, fontSize: 29, fill: ink, textAlign: 'left' },
+    typeLine: { ...aligned, left: 52, top: 210, width: 238, fontSize: 17, fill: deep, textAlign: 'left' },
+    rules: { ...aligned, left: 52, top: 278, width: 232, fontSize: 23, fill: ink, textAlign: 'left' },
+    stats: { ...centered, left: 82, top: 794, width: 74, fontSize: 20, fill: paper, textAlign: 'center' },
+  }
+  if (preset.layout === 'landscape') return {
+    art: { left: 44, top: 168, width: 542, height: 380 },
+    title: { ...centered, left: 315, top: 86, width: 500, fontSize: 31, fill: paper, textAlign: 'center' },
+    typeLine: { ...aligned, left: 55, top: 590, width: 430, fontSize: 18, fill: paper, textAlign: 'left' },
+    rules: { ...aligned, left: 58, top: 660, width: 416, fontSize: 22, fill: ink, textAlign: 'left' },
+    stats: { ...centered, left: 548, top: 732, width: 74, fontSize: 22, fill: deep, textAlign: 'center' },
+  }
+  if (preset.layout === 'poster') return {
+    art: { left: 56, top: 176, width: 518, height: 528 },
+    title: { ...centered, left: 315, top: 90, width: 520, fontSize: 34, fill: ink, textAlign: 'center' },
+    typeLine: { ...aligned, left: 64, top: 750, width: 300, fontSize: 17, fill: paper, textAlign: 'left' },
+    rules: { ...aligned, left: 64, top: 790, width: 400, fontSize: 17, fill: paper, textAlign: 'left' },
+    stats: { ...centered, left: 536, top: 790, width: 82, fontSize: 22, fill: paper, textAlign: 'center' },
+  }
+  return {
+    art: { left: 65, top: 186, width: 500, height: 356 },
+    title: { ...centered, left: 315, top: 92, width: 450, fontSize: 30, fill: paper, textAlign: 'center' },
+    typeLine: { ...aligned, left: 72, top: 600, width: 456, fontSize: 18, fill: paper, textAlign: 'left' },
+    rules: { ...aligned, left: 78, top: 668, width: 444, fontSize: 22, fill: ink, textAlign: 'left' },
+    stats: { ...centered, left: 546, top: 818, width: 76, fontSize: 21, fill: paper, textAlign: 'center' },
+  }
+}
+
+function createTemplateText(text: string, name: string, options: ConstructorParameters<typeof Textbox>[1]): Textbox {
+  const object = new Textbox(text, options)
+  setLayerMeta(object, { id: generateLayerId(), kind: 'text', name, scope: 'model' })
+  applyRuntimeConfig(object)
+  return object
+}
+
+async function applyCardTemplate(preset: CardTemplatePreset): Promise<void> {
+  persistActiveDeckDocument()
+  const deck = currentDeck()
+  activeEditMode = 'model'
+  activeRightPanelTab = 'model-layers'
+  destroySelectedTextEditor()
+  canvas.clear()
+  layerById.clear()
+  baseLayerId = ''
+
+  await withLoading(async () => {
+    const layout = templateLayoutSpec(preset)
+    const base = await FabricImage.fromURL(svgDataUrl(templateBaseSvg(preset)))
+    base.set({ left: 0, top: 0, originX: 'left', originY: 'top' })
+    baseLayerId = generateLayerId()
+    setLayerMeta(base, { id: baseLayerId, kind: 'base', name: `Base • ${preset.name}`, scope: 'model' })
+    applyRuntimeConfig(base)
+
+    const illustration = await FabricImage.fromURL(svgDataUrl(templateIllustrationSvg(preset, layout.art.width, layout.art.height)))
+    illustration.set({ left: layout.art.left, top: layout.art.top, originX: 'left', originY: 'top' })
+    setLayerMeta(illustration, { id: generateLayerId(), kind: 'image', name: 'Ilustração', scope: 'model', fit: 'cover', slotWidth: layout.art.width, slotHeight: layout.art.height })
+    applyRuntimeConfig(illustration)
+
+    if (layout.baseAboveArt) canvas.add(illustration, base)
+    else canvas.add(base, illustration)
+
+    const title = createTemplateText(preset.title, 'Nome da carta', { fontFamily: 'Cinzel Decorative', fontWeight: 'bold', lineHeight: 1.05, ...layout.title })
+    const typeLine = createTemplateText(preset.typeLine, 'Tipo da carta', { fontFamily: 'Cinzel Decorative', fontWeight: 'bold', lineHeight: 1.05, ...layout.typeLine })
+    const rules = createTemplateText(preset.rules, 'Texto de regras', { fontFamily: 'Arial', lineHeight: 1.22, ...layout.rules })
+    const stats = createTemplateText(preset.stats, 'Atributos', { fontFamily: 'Cinzel Decorative', fontWeight: 'bold', lineHeight: 1, ...layout.stats })
+    canvas.add(title, typeLine, rules, stats)
+
+    deck.modelCanvas = canvas.toObject(['data'])
+    deck.cards.forEach((card) => { card.modelOverrides = {}; card.thumbnail = '' })
+    refreshLayerIndex()
+    canvas.discardActiveObject()
+    canvas.requestRenderAll()
+    renderWorkspaceTabs()
+    await refreshDeckThumbnails(deck)
+  })
+}
+
+function renderTemplateGallery(): void {
+  templatesGrid.innerHTML = ''
+  CARD_TEMPLATE_PRESETS.forEach((preset) => {
+    const card = document.createElement('article')
+    card.className = 'template-card'
+    card.style.setProperty('--template-ink', preset.colors[0])
+    card.style.setProperty('--template-accent', preset.colors[1])
+    card.style.setProperty('--template-paper', preset.colors[2])
+    card.style.setProperty('--template-deep', preset.colors[3])
+    card.innerHTML = `<div class="template-card-preview layout-${preset.layout}"><div class="template-preview-title">${preset.title}</div><div class="template-preview-art"><span class="material-symbols-outlined">image</span></div><div class="template-preview-type">${preset.typeLine}</div><div class="template-preview-copy">Texto de regras e habilidades da carta.</div><div class="template-preview-stat">${preset.stats}</div></div><div class="template-card-content"><span class="template-family">${preset.family}</span><h3>${preset.name}</h3><p>${preset.description}</p><button class="primary template-apply" type="button">Usar este modelo</button></div>`
+    card.querySelector<HTMLButtonElement>('.template-apply')?.addEventListener('click', async () => {
+      const hasModel = activeEditMode === 'model'
+        ? canvas.getObjects().length > 0
+        : ((currentDeck().modelCanvas.objects ?? []) as unknown[]).length > 0
+      if (hasModel && !window.confirm('Aplicar este modelo substituirá o layout atual da frente. Continuar?')) return
+      templatesModal.hidden = true
+      try {
+        await applyCardTemplate(preset)
+      } catch {
+        window.alert('Não foi possível aplicar o modelo selecionado.')
+      }
+    })
+    templatesGrid.append(card)
+  })
+}
+
 async function ensureBaseLayer(url?: string): Promise<void> {
   return withLoading(async () => {
     if (!url) {
@@ -3779,7 +4065,10 @@ async function generateDeckPrintSheets(downloadFormat: 'zip' | 'pdf'): Promise<v
         deck.cards.map(async (card) => captureDeckCardPrintImage(deck, card.id)),
       )
       const imageElements = await Promise.all(cardImages.map(async (src) => loadImageElement(src)))
-      const backImage = await loadImageElement(await captureDeckBackPrintImage(deck))
+      const includeBack = printIncludeBackSwitch.checked
+      const backImage = includeBack
+        ? await loadImageElement(await captureDeckBackPrintImage(deck))
+        : null
 
       const totalPages = Math.ceil(deck.cards.length / layout.perSheet)
       const paperWidthPx = mmToPx(layout.paper.widthMm)
@@ -3800,7 +4089,8 @@ async function generateDeckPrintSheets(downloadFormat: 'zip' | 'pdf'): Promise<v
         : null
 
       for (let pageIndex = 0; pageIndex < totalPages; pageIndex += 1) {
-        for (const side of ['frente', 'verso'] as const) {
+        const sides: Array<'frente' | 'verso'> = includeBack ? ['frente', 'verso'] : ['frente']
+        for (const side of sides) {
           const sheetCanvas = document.createElement('canvas')
           sheetCanvas.width = paperWidthPx
           sheetCanvas.height = paperHeightPx
@@ -3819,7 +4109,9 @@ async function generateDeckPrintSheets(downloadFormat: 'zip' | 'pdf'): Promise<v
             const col = side === 'verso' ? layout.columns - 1 - frontCol : frontCol
             const x = marginPx + col * (cardWidthPx + gapPx)
             const y = marginPx + row * (cardHeightPx + gapPx)
-            context.drawImage(side === 'verso' ? backImage : imageElements[cardIndex], x, y, cardWidthPx, cardHeightPx)
+            const printImage = side === 'verso' ? backImage : imageElements[cardIndex]
+            if (!printImage) throw new Error('Falha ao preparar o verso para impressao.')
+            context.drawImage(printImage, x, y, cardWidthPx, cardHeightPx)
           }
 
           if (downloadFormat === 'zip' && zip) {
@@ -3893,7 +4185,8 @@ function updatePrintPreview(): void {
 
   const limitedLabel = total > previewCount ? ` (mostrando ${previewCount})` : ''
   const orientationLabel = printOrientationSelect.value === 'landscape' ? 'Paisagem' : 'Retrato'
-  printLayoutSummary.textContent = `${orientationLabel}: ${layout.columns} colunas x ${layout.rows} linhas = ${total} cartas por folha${limitedLabel}`
+  const sidesLabel = printIncludeBackSwitch.checked ? 'frente e verso' : 'somente frente'
+  printLayoutSummary.textContent = `${orientationLabel}: ${layout.columns} colunas x ${layout.rows} linhas = ${total} cartas por folha${limitedLabel} (${sidesLabel})`
 }
 
 function openPrintModal(): void {
@@ -4064,6 +4357,19 @@ openPrintModalButton.addEventListener('click', () => {
   openPrintModal()
 })
 
+openTemplatesButton.addEventListener('click', () => {
+  renderTemplateGallery()
+  templatesModal.hidden = false
+})
+
+closeTemplatesModalButton.addEventListener('click', () => {
+  templatesModal.hidden = true
+})
+
+templatesModalBackdrop.addEventListener('click', () => {
+  templatesModal.hidden = true
+})
+
 closePrintModalButton.addEventListener('click', closePrintModal)
 printModalBackdrop.addEventListener('click', closePrintModal)
 
@@ -4076,6 +4382,7 @@ printCardHeightInput.addEventListener('input', updatePrintPreview)
 printPaperSizeSelect.addEventListener('change', updatePrintPreview)
 printOrientationSelect.addEventListener('change', updatePrintPreview)
 printGapInput.addEventListener('input', updatePrintPreview)
+printIncludeBackSwitch.addEventListener('change', updatePrintPreview)
 generateDeckPrintZipButton.addEventListener('click', () => {
   void generateDeckPrintSheets('zip')
 })
@@ -4087,6 +4394,9 @@ generateDeckPrintPdfButton.addEventListener('click', () => {
 window.addEventListener('keydown', (event) => {
   if (event.key === 'Escape' && !printModal.hidden) {
     closePrintModal()
+  }
+  if (event.key === 'Escape' && !templatesModal.hidden) {
+    templatesModal.hidden = true
   }
 })
 
