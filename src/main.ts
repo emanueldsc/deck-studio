@@ -57,6 +57,8 @@ interface LayerMeta {
   fit?: ImageFitMode
   slotWidth?: number
   slotHeight?: number
+  cropPositionX?: number
+  cropPositionY?: number
   richTextSource?: string
   richTextFormat?: RichTextFormat
 }
@@ -68,6 +70,8 @@ interface CardModelOverride {
   textProps?: CardTextPropsOverride
   src?: string
   fit?: ImageFitMode
+  cropPositionX?: number
+  cropPositionY?: number
 }
 
 interface CardState {
@@ -287,6 +291,7 @@ let activeEditMode: EditMode = 'deck'
 let deckCount = 0
 let deckDocuments: DeckDocument[] = []
 let activeDeckId = ''
+let cropPanLayerId: string | null = null
 
 function generateDeckId(): string {
   if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
@@ -972,20 +977,75 @@ function sourceObjectBox(object: FabricObject): { width: number; height: number 
   }
 }
 
-function applyImageFit(image: FabricImage, fit: ImageFitMode, targetWidth: number, targetHeight: number): void {
-  const naturalWidth = Math.max(1, image.width ?? 1)
-  const naturalHeight = Math.max(1, image.height ?? 1)
+function naturalImageBox(image: FabricImage): { width: number; height: number } {
+  const element = image.getElement() as CanvasImageSource & {
+    naturalWidth?: number
+    naturalHeight?: number
+    videoWidth?: number
+    videoHeight?: number
+    width?: number
+    height?: number
+  }
+  return {
+    width: Math.max(1, element.naturalWidth ?? element.videoWidth ?? element.width ?? image.width ?? 1),
+    height: Math.max(1, element.naturalHeight ?? element.videoHeight ?? element.height ?? image.height ?? 1),
+  }
+}
+
+function applyImageFit(
+  image: FabricImage,
+  fit: ImageFitMode,
+  targetWidth: number,
+  targetHeight: number,
+  cropPositionX = 0.5,
+  cropPositionY = 0.5,
+): void {
+  const natural = naturalImageBox(image)
+  const naturalWidth = natural.width
+  const naturalHeight = natural.height
+
+  image.set({
+    cropX: 0,
+    cropY: 0,
+    width: naturalWidth,
+    height: naturalHeight,
+  })
 
   if (fit === 'fill') {
     image.set({ scaleX: targetWidth / naturalWidth, scaleY: targetHeight / naturalHeight })
     return
   }
 
+  if (fit === 'cover') {
+    const targetRatio = targetWidth / targetHeight
+    const naturalRatio = naturalWidth / naturalHeight
+    let cropWidth = naturalWidth
+    let cropHeight = naturalHeight
+    let cropX = 0
+    let cropY = 0
+
+    if (naturalRatio > targetRatio) {
+      cropWidth = naturalHeight * targetRatio
+      cropX = (naturalWidth - cropWidth) * clamp(0, 1, cropPositionX)
+    } else {
+      cropHeight = naturalWidth / targetRatio
+      cropY = (naturalHeight - cropHeight) * clamp(0, 1, cropPositionY)
+    }
+
+    image.set({
+      cropX,
+      cropY,
+      width: cropWidth,
+      height: cropHeight,
+      scaleX: targetWidth / cropWidth,
+      scaleY: targetHeight / cropHeight,
+    })
+    return
+  }
+
   let scale = 1
   if (fit === 'contain') {
     scale = Math.min(targetWidth / naturalWidth, targetHeight / naturalHeight)
-  } else if (fit === 'cover') {
-    scale = Math.max(targetWidth / naturalWidth, targetHeight / naturalHeight)
   } else if (fit === 'scale-down') {
     scale = Math.min(1, Math.min(targetWidth / naturalWidth, targetHeight / naturalHeight))
   }
@@ -1000,7 +1060,7 @@ function applyImageFitForObject(object: FabricImage, fit: ImageFitMode): void {
     height: Math.max(1, meta.slotHeight ?? sourceObjectBox(object).height),
   }
 
-  applyImageFit(object, fit, target.width, target.height)
+  applyImageFit(object, fit, target.width, target.height, meta.cropPositionX, meta.cropPositionY)
   setLayerMeta(object, { ...meta, fit, slotWidth: target.width, slotHeight: target.height })
 }
 
@@ -1042,7 +1102,66 @@ function openIllustrationUpload(): void {
 
 function createImageBehaviorControls(object: FabricImage): DocumentFragment {
   const fragment = document.createDocumentFragment()
-  const meta = getLayerMeta(object)
+  const fitField = document.createElement('select')
+  fitField.className = 'image-fit-select'
+  const fitOptions: Array<{ value: ImageFitMode; label: string }> = [
+    { value: 'cover', label: 'Cobrir área (cover)' },
+    { value: 'contain', label: 'Conter imagem (contain)' },
+    { value: 'fill', label: 'Esticar para preencher (fill)' },
+    { value: 'none', label: 'Tamanho original (none)' },
+    { value: 'scale-down', label: 'Reduzir se necessário (scale-down)' },
+  ]
+  const currentFit = normalizeImageFit(getLayerMeta(object).fit ?? 'contain')
+  fitOptions.forEach(({ value, label }) => {
+    const option = document.createElement('option')
+    option.value = value
+    option.textContent = label
+    option.selected = value === currentFit
+    fitField.append(option)
+  })
+  attachNoDragPropagation(fitField)
+  fitField.addEventListener('change', () => {
+    const fit = normalizeImageFit(fitField.value, 'contain')
+    if (fit !== 'cover' && cropPanLayerId === getLayerMeta(object).id) {
+      cropPanLayerId = null
+      canvas.upperCanvasEl.classList.remove('is-crop-panning')
+    }
+    applyImageFitForObject(object, fit)
+    object.setCoords()
+    canvas.requestRenderAll()
+    persistActiveDeckDocument()
+    renderCardThumbnails()
+    syncCropButton()
+  })
+  fragment.append(detailsRow('Ajuste da imagem', fitField))
+
+  const fitHint = document.createElement('p')
+  fitHint.className = 'layer-note image-fit-hint'
+  fitHint.textContent = 'Cobrir recorta as bordas sem deformar; conter mostra a imagem inteira.'
+  fragment.append(fitHint)
+
+  const cropButton = document.createElement('button')
+  cropButton.type = 'button'
+  cropButton.className = 'ghost image-crop-button'
+  attachNoDragPropagation(cropButton)
+  const syncCropButton = (): void => {
+    const layerId = getLayerMeta(object).id
+    const enabled = normalizeImageFit(fitField.value, 'contain') === 'cover'
+    const active = cropPanLayerId === layerId
+    cropButton.disabled = !enabled
+    cropButton.classList.toggle('is-active', active)
+    cropButton.textContent = active ? 'Concluir enquadramento' : 'Arrastar enquadramento'
+  }
+  cropButton.addEventListener('click', () => {
+    const layerId = getLayerMeta(object).id
+    cropPanLayerId = cropPanLayerId === layerId ? null : layerId
+    canvas.setActiveObject(object)
+    canvas.upperCanvasEl.classList.toggle('is-crop-panning', cropPanLayerId === layerId)
+    canvas.requestRenderAll()
+    syncCropButton()
+  })
+  syncCropButton()
+  fragment.append(detailsRow('Posição do recorte', cropButton))
 
   const fileField = document.createElement('input')
   fileField.type = 'file'
@@ -1053,7 +1172,8 @@ function createImageBehaviorControls(object: FabricImage): DocumentFragment {
     if (!file) return
     try {
       const dataUrl = await fileToDataUrl(file)
-      await replaceIllustrationOnObject(object, dataUrl, normalizeImageFit(meta.fit ?? 'contain'))
+      const selectedFit = normalizeImageFit(getLayerMeta(object).fit ?? fitField.value, 'contain')
+      await replaceIllustrationOnObject(object, dataUrl, selectedFit)
       canvas.requestRenderAll()
       persistActiveDeckDocument()
       renderCardThumbnails()
@@ -1067,7 +1187,7 @@ function createImageBehaviorControls(object: FabricImage): DocumentFragment {
 
   const hint = document.createElement('p')
   hint.className = 'layer-note'
-  hint.textContent = 'Dê duplo clique na imagem para abrir o upload.'
+  hint.textContent = 'Em cover, ative “Arrastar enquadramento” e arraste a imagem. Dê duplo clique para trocar o arquivo.'
   fragment.append(hint)
 
   return fragment
@@ -1147,13 +1267,20 @@ function collectCardModelOverrides(
     const currentSrc = typeof current['src'] === 'string' ? current['src'] : ''
     const baseSrc = typeof base['src'] === 'string' ? base['src'] : ''
     const currentFit = isImageFitMode(data?.fit) ? data.fit : undefined
+    const baseData = base['data'] as Partial<LayerMeta> | undefined
+    const currentCropX = typeof data?.cropPositionX === 'number' ? data.cropPositionX : 0.5
+    const currentCropY = typeof data?.cropPositionY === 'number' ? data.cropPositionY : 0.5
+    const baseCropX = typeof baseData?.cropPositionX === 'number' ? baseData.cropPositionX : 0.5
+    const baseCropY = typeof baseData?.cropPositionY === 'number' ? baseData.cropPositionY : 0.5
+    const cropChanged = Math.abs(currentCropX - baseCropX) > 0.0001 || Math.abs(currentCropY - baseCropY) > 0.0001
+    const cropOverride = cropChanged ? { cropPositionX: currentCropX, cropPositionY: currentCropY } : {}
     if (currentSrc && currentSrc !== baseSrc) {
-      overrides[id] = { src: currentSrc, fit: currentFit }
+      overrides[id] = { src: currentSrc, fit: currentFit, ...cropOverride }
       continue
     }
 
-    if (currentFit) {
-      overrides[id] = { fit: currentFit }
+    if (currentFit || cropChanged) {
+      overrides[id] = { fit: currentFit, ...cropOverride }
     }
   }
 
@@ -1197,7 +1324,7 @@ function applyDeckModelImageFit(targetCanvas: Canvas): void {
     const targetWidth = Math.max(1, meta.slotWidth ?? object.getScaledWidth?.() ?? object.width ?? 1)
     const targetHeight = Math.max(1, meta.slotHeight ?? object.getScaledHeight?.() ?? object.height ?? 1)
 
-    applyImageFit(object, fit, targetWidth, targetHeight)
+    applyImageFit(object, fit, targetWidth, targetHeight, meta.cropPositionX, meta.cropPositionY)
     setLayerMeta(object, { ...meta, fit, slotWidth: targetWidth, slotHeight: targetHeight })
     object.setCoords()
   })
@@ -1311,6 +1438,8 @@ function buildCardCanvasState(deck: DeckDocument, cardId: string): ReturnType<Ca
       // preserve slot dimensions so loadDeckCanvas can reapply fit without recalculating
       ...(existingData?.['slotWidth'] != null ? { slotWidth: existingData['slotWidth'] } : {}),
       ...(existingData?.['slotHeight'] != null ? { slotHeight: existingData['slotHeight'] } : {}),
+      ...(typeof override.cropPositionX === 'number' ? { cropPositionX: override.cropPositionX } : {}),
+      ...(typeof override.cropPositionY === 'number' ? { cropPositionY: override.cropPositionY } : {}),
     }
 
     if (kind === 'text') {
@@ -2385,7 +2514,7 @@ async function loadDeckCanvas(state: ReturnType<Canvas['toObject']>): Promise<vo
         const targetWidth = Math.max(1, meta.slotWidth ?? object.getScaledWidth?.() ?? object.width ?? 1)
         const targetHeight = Math.max(1, meta.slotHeight ?? object.getScaledHeight?.() ?? object.height ?? 1)
 
-        applyImageFit(object, fit, targetWidth, targetHeight)
+        applyImageFit(object, fit, targetWidth, targetHeight, meta.cropPositionX, meta.cropPositionY)
         setLayerMeta(object, { ...meta, fit, slotWidth: targetWidth, slotHeight: targetHeight })
         object.setCoords()
       })
@@ -2429,6 +2558,8 @@ function getLayerMeta(object: FabricObject): LayerMeta {
     fit: kind === 'image' ? normalizeImageFit(raw?.fit ?? 'contain') : undefined,
     slotWidth: raw?.slotWidth,
     slotHeight: raw?.slotHeight,
+    cropPositionX: typeof raw?.cropPositionX === 'number' ? clamp(0, 1, raw.cropPositionX) : 0.5,
+    cropPositionY: typeof raw?.cropPositionY === 'number' ? clamp(0, 1, raw.cropPositionY) : 0.5,
     richTextSource: typeof raw?.richTextSource === 'string' ? raw.richTextSource : undefined,
     richTextFormat: raw?.richTextFormat === 'html' ? 'html' : 'tags',
   }
@@ -4316,6 +4447,79 @@ function attachCanvasDnD(): void {
   })
 }
 
+function attachImageCropPanning(): void {
+  const surface = canvas.upperCanvasEl
+  let drag: {
+    pointerId: number
+    object: FabricImage
+    startX: number
+    startY: number
+    startCropX: number
+    startCropY: number
+    maxCropX: number
+    maxCropY: number
+    scaleX: number
+    scaleY: number
+  } | null = null
+
+  surface.addEventListener('pointerdown', (event) => {
+    if (!cropPanLayerId) return
+    const object = layerById.get(cropPanLayerId)
+    if (!(object instanceof FabricImage) || canvas.getActiveObject() !== object) return
+    const meta = getLayerMeta(object)
+    if (normalizeImageFit(meta.fit ?? 'contain') !== 'cover') return
+
+    const natural = naturalImageBox(object)
+    drag = {
+      pointerId: event.pointerId,
+      object,
+      startX: event.clientX,
+      startY: event.clientY,
+      startCropX: object.cropX ?? 0,
+      startCropY: object.cropY ?? 0,
+      maxCropX: Math.max(0, natural.width - (object.width ?? natural.width)),
+      maxCropY: Math.max(0, natural.height - (object.height ?? natural.height)),
+      scaleX: Math.max(0.0001, Math.abs(object.scaleX ?? 1)),
+      scaleY: Math.max(0.0001, Math.abs(object.scaleY ?? 1)),
+    }
+    surface.setPointerCapture(event.pointerId)
+    surface.classList.add('is-crop-dragging')
+    event.preventDefault()
+    event.stopImmediatePropagation()
+  }, true)
+
+  surface.addEventListener('pointermove', (event) => {
+    if (!drag || event.pointerId !== drag.pointerId) return
+    const displayScale = Math.max(0.0001, canvasDisplayZoom)
+    const cropX = clamp(0, drag.maxCropX, drag.startCropX - (event.clientX - drag.startX) / displayScale / drag.scaleX)
+    const cropY = clamp(0, drag.maxCropY, drag.startCropY - (event.clientY - drag.startY) / displayScale / drag.scaleY)
+    const meta = getLayerMeta(drag.object)
+    setLayerMeta(drag.object, {
+      ...meta,
+      cropPositionX: drag.maxCropX > 0 ? cropX / drag.maxCropX : 0.5,
+      cropPositionY: drag.maxCropY > 0 ? cropY / drag.maxCropY : 0.5,
+    })
+    applyImageFitForObject(drag.object, 'cover')
+    drag.object.setCoords()
+    canvas.requestRenderAll()
+    event.preventDefault()
+    event.stopImmediatePropagation()
+  }, true)
+
+  const stopDragging = (event: PointerEvent): void => {
+    if (!drag || event.pointerId !== drag.pointerId) return
+    surface.releasePointerCapture(event.pointerId)
+    surface.classList.remove('is-crop-dragging')
+    persistActiveDeckDocument()
+    renderCardThumbnails()
+    drag = null
+    event.preventDefault()
+    event.stopImmediatePropagation()
+  }
+  surface.addEventListener('pointerup', stopDragging, true)
+  surface.addEventListener('pointercancel', stopDragging, true)
+}
+
 editModelButton.addEventListener('click', () => {
   if (activeEditMode === 'model') {
     activeRightPanelTab = 'model-layers'
@@ -4608,6 +4812,7 @@ window.addEventListener('resize', () => {
 })
 
 attachCanvasDnD()
+attachImageCropPanning()
 renderWorkspaceSidebar()
 syncModeControls()
 syncBackToEditorButton()

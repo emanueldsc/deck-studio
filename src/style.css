@@ -760,6 +760,16 @@ button.tiny {
   line-height: 1.35;
 }
 
+.image-crop-button { width: 100%; }
+.image-crop-button.is-active {
+  color: #ffffff;
+  background: linear-gradient(145deg, var(--accent), var(--accent-2));
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent), transparent 72%);
+}
+.image-crop-button:disabled { opacity: .5; cursor: not-allowed; }
+.upper-canvas.is-crop-panning { cursor: grab !important; }
+.upper-canvas.is-crop-dragging { cursor: grabbing !important; }
+
 .layer-detail-row {
   display: block;
 }
