@@ -1785,6 +1785,10 @@ app.innerHTML = `
           <input id="deckNameInput" type="text" placeholder="Baralho 1" aria-describedby="deckNameHint" />
         </label>
         <p id="deckNameHint" class="hint">A extensão .deck é adicionada ao salvar.</p>
+        <button id="openPresetDecksButton" class="menu-item preset-decks-menu-item" type="button">
+          <span class="material-symbols-outlined" aria-hidden="true">style</span>
+          <span>Decks prontos</span>
+        </button>
         <div class="cover-field">
           <span class="cover-field-label">Capa do deck</span>
           <div class="cover-field-row">
@@ -1809,13 +1813,6 @@ app.innerHTML = `
         <button id="openTutorialButton" class="menu-item" type="button">
           <span class="material-symbols-outlined" aria-hidden="true">school</span>
           <span>Como usar</span>
-        </button>
-      </nav>
-
-      <nav class="menu-list" aria-label="Decks prontos">
-        <button id="openPresetDecksButton" class="menu-item" type="button">
-          <span class="material-symbols-outlined" aria-hidden="true">style</span>
-          <span>Decks prontos</span>
         </button>
       </nav>
 
@@ -1847,6 +1844,27 @@ app.innerHTML = `
         <p class="subtitle compact" id="editItemLabel">Selecione um item da carta para editar.</p>
         <div id="editPanelContent" class="edit-panel-content"></div>
       </section>
+    </div>
+    <div class="library-launcher">
+      <button id="openModelToolsButton" class="library-launch-button" type="button" hidden>
+        <span class="material-symbols-outlined" aria-hidden="true">tune</span>
+        <span>Ferramentas</span>
+      </button>
+      <button id="openLibraryButton" class="library-launch-button" type="button">
+        <span class="material-symbols-outlined" aria-hidden="true">collections</span>
+        <span>Biblioteca gráfica</span>
+      </button>
+    </div>
+    </div>
+  </section>
+
+  <div id="modelToolsModal" class="print-modal" hidden>
+    <div id="modelToolsModalBackdrop" class="print-modal-backdrop"></div>
+    <section class="print-modal-dialog model-tools-modal-dialog" role="dialog" aria-modal="true" aria-labelledby="modelToolsModalTitle">
+      <header class="print-modal-header">
+        <h2 id="modelToolsModalTitle">Ferramentas do modelo</h2>
+        <button id="closeModelToolsButton" class="ghost tiny" type="button" aria-label="Fechar ferramentas">Fechar</button>
+      </header>
       <div id="modelTools" class="model-tools">
         <div class="control-block">
           <h2>Fundo da carta</h2>
@@ -1878,15 +1896,8 @@ app.innerHTML = `
           <p class="hint">Selecione a forma e edite preenchimento, contorno, cantos e tamanho no painel de edição.</p>
         </div>
       </div>
-    </div>
-    <div class="library-launcher">
-      <button id="openLibraryButton" class="library-launch-button" type="button">
-        <span class="material-symbols-outlined" aria-hidden="true">collections</span>
-        <span>Biblioteca de gráficos</span>
-      </button>
-    </div>
-    </div>
-  </section>
+    </section>
+  </div>
 
   <div id="libraryModal" class="print-modal" hidden>
     <div id="libraryModalBackdrop" class="print-modal-backdrop"></div>
@@ -2174,6 +2185,11 @@ function requireElement<T extends Element>(root: ParentNode, selector: string): 
 
 const addTextButton = requireElement<HTMLButtonElement>(app, '#addTextButton')
 const shapePalette = requireElement<HTMLDivElement>(app, '#shapePalette')
+const openModelToolsButton = requireElement<HTMLButtonElement>(app, '#openModelToolsButton')
+const libraryLauncher = requireElement<HTMLDivElement>(app, '.library-launcher')
+const modelToolsModal = requireElement<HTMLDivElement>(app, '#modelToolsModal')
+const closeModelToolsButton = requireElement<HTMLButtonElement>(app, '#closeModelToolsButton')
+const modelToolsModalBackdrop = requireElement<HTMLDivElement>(app, '#modelToolsModalBackdrop')
 const openLibraryButton = requireElement<HTMLButtonElement>(app, '#openLibraryButton')
 const libraryModal = requireElement<HTMLDivElement>(app, '#libraryModal')
 const closeLibraryButton = requireElement<HTMLButtonElement>(app, '#closeLibraryButton')
@@ -2227,7 +2243,6 @@ const importDeckInput = requireElement<HTMLInputElement>(app, '#importDeckInput'
 const editModelButton = requireElement<HTMLButtonElement>(app, '#editModelButton')
 const editBackButton = requireElement<HTMLButtonElement>(app, '#editBackButton')
 const editDeckButton = requireElement<HTMLButtonElement>(app, '#editDeckButton')
-const modelTools = requireElement<HTMLDivElement>(app, '#modelTools')
 const mainMenuButton = requireElement<HTMLButtonElement>(app, '#mainMenuButton')
 const mainMenuPanel = requireElement<HTMLDivElement>(app, '#mainMenuPanel')
 const openPrintModalButton = requireElement<HTMLButtonElement>(app, '#openPrintModalButton')
@@ -2442,7 +2457,9 @@ function renderWorkspaceTabs(): void {
   cardsSection.hidden = !showCards
   layersSection.classList.toggle('tab-panel-hidden', !showLayers)
   cardsSection.classList.toggle('tab-panel-hidden', !showCards)
-  modelTools.hidden = !templateActive
+  openModelToolsButton.hidden = !templateActive
+  libraryLauncher.classList.toggle('library-only', !templateActive)
+  if (!templateActive) modelToolsModal.hidden = true
 
   if (showLayers) {
     renderVariantBar()
@@ -5326,6 +5343,7 @@ async function importDeckFile(file: File): Promise<void> {
 
     if (parsed['version'] === 1 && parsed['deck']) {
       rawDeck = { ...(parsed['deck'] as Record<string, unknown>) }
+      if (typeof rawDeck['cover'] !== 'string' && typeof parsed['cover'] === 'string') rawDeck['cover'] = parsed['cover']
       if (!rawDeck['name']) rawDeck['name'] = file.name.replace(/\.deck$/i, '') || DEFAULT_DECK_NAME
     } else if (parsed['canvas'] || parsed['modelCanvas']) {
       rawDeck = { ...parsed }
@@ -5773,7 +5791,10 @@ variantNameInput.addEventListener('input', renameVariant)
 variantDeleteButton.addEventListener('click', () => { void deleteVariant() })
 cardModelSelect.addEventListener('change', () => { void changeActiveCardModel(cardModelSelect.value) })
 cardBackSelect.addEventListener('change', () => { changeActiveCardBack(cardBackSelect.value) })
-changeBaseButton.addEventListener('click', () => { baseImageInput.click() })
+changeBaseButton.addEventListener('click', () => {
+  modelToolsModal.hidden = true
+  baseImageInput.click()
+})
 
 importDeckButton.addEventListener('click', () => {
   importDeckInput.click()
@@ -5791,7 +5812,15 @@ function fetchPresetCover(file: string): Promise<string> {
       if (!res.ok) return ''
       const parsed = JSON.parse(await decompressDeckText(new File([await res.blob()], file))) as Record<string, unknown>
       const deck = (parsed['deck'] ?? parsed) as Record<string, unknown>
-      return typeof deck['cover'] === 'string' ? deck['cover'] : ''
+      if (typeof deck['cover'] === 'string' && deck['cover']) return deck['cover']
+      if (typeof parsed['cover'] === 'string' && parsed['cover']) return parsed['cover']
+      const backs = Array.isArray(deck['backs']) ? deck['backs'] as Array<Record<string, unknown>> : []
+      const activeBackId = typeof deck['activeBackId'] === 'string' ? deck['activeBackId'] : ''
+      const activeBack = backs.find((back) => back['id'] === activeBackId)
+      const backThumbnail = activeBack?.['thumbnail'] || backs[0]?.['thumbnail']
+      if (typeof backThumbnail === 'string' && backThumbnail) return backThumbnail
+      const firstCard = Array.isArray(deck['cards']) ? deck['cards'][0] as Record<string, unknown> | undefined : undefined
+      return typeof firstCard?.['thumbnail'] === 'string' ? firstCard['thumbnail'] : ''
     })().catch(() => '')
     presetCoverCache.set(file, cached)
   }
@@ -5922,8 +5951,13 @@ addGraphicButton.addEventListener('click', () => {
     window.alert('No modo Baralho, edite apenas os layers existentes da carta.')
     return
   }
+  modelToolsModal.hidden = true
   void addGraphicReferenceLayer()
 })
+
+openModelToolsButton.addEventListener('click', () => { modelToolsModal.hidden = false })
+closeModelToolsButton.addEventListener('click', () => { modelToolsModal.hidden = true })
+modelToolsModalBackdrop.addEventListener('click', () => { modelToolsModal.hidden = true })
 
 openLibraryButton.addEventListener('click', () => {
   renderLibrary()
@@ -5948,6 +5982,7 @@ shapePalette.addEventListener('click', (event) => {
   const button = (event.target as HTMLElement).closest<HTMLButtonElement>('button[data-shape]')
   if (!button || button.disabled) return
   addShapeLayer(button.dataset.shape as ShapeType)
+  modelToolsModal.hidden = true
 })
 
 addTextButton.addEventListener('click', () => {
@@ -5955,6 +5990,7 @@ addTextButton.addEventListener('click', () => {
     window.alert('No modo Baralho, edite apenas os textos ja existentes da carta.')
     return
   }
+  modelToolsModal.hidden = true
   addTextLayer()
 })
 
@@ -6021,6 +6057,9 @@ document.addEventListener('click', (event) => {
   if (!mainMenuPanel.hidden && !(event.target as HTMLElement).closest('.menu-dropdown')) setMainMenuOpen(false)
 })
 window.addEventListener('keydown', (event) => {
+  if (event.key === 'Escape' && !modelToolsModal.hidden) {
+    modelToolsModal.hidden = true
+  }
   if (event.key === 'Escape' && !libraryModal.hidden) {
     libraryModal.hidden = true
   }
