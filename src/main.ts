@@ -4,21 +4,31 @@ import { TextStyle } from '@tiptap/extension-text-style'
 import Underline from '@tiptap/extension-underline'
 import StarterKit from '@tiptap/starter-kit'
 import {
-  Canvas,
-  FabricImage,
-  FabricText,
-  Textbox,
-  type FabricObject,
+    Canvas,
+    Ellipse,
+    Color as FabricColor,
+    FabricImage,
+    FabricText,
+    Line,
+    Polygon,
+    Rect,
+    Textbox,
+    Triangle,
+    type FabricObject,
 } from 'fabric'
 import { jsPDF } from 'jspdf'
 import JSZip from 'jszip'
-import './style.css'
 import { withLoading } from './loading'
+import './style.css'
 
 type LayerKind =
   | 'base'
   | 'image'
   | 'text'
+  | 'shape'
+  | 'graphic'
+
+type ShapeType = 'rect' | 'rounded' | 'ellipse' | 'triangle' | 'diamond' | 'pentagon' | 'hexagon' | 'star' | 'line'
 
 type LayerScope = 'model' | 'deck' | 'back'
 type EditMode = LayerScope
@@ -78,18 +88,48 @@ interface CardState {
   id: string
   name: string
   deckObjects: unknown[]
+  modelId: string
+  backId: string
   modelOverrides: Record<string, CardModelOverride>
   thumbnail: string
+}
+
+interface CardModel {
+  id: string
+  name: string
+  canvas: ReturnType<Canvas['toObject']>
+}
+
+interface CardBack {
+  id: string
+  name: string
+  canvas: ReturnType<Canvas['toObject']>
+  thumbnail: string
+}
+
+interface LibraryAsset {
+  id: string
+  name: string
+  src: string
+  width: number
+  height: number
 }
 
 interface DeckDocument {
   id: string
   name: string
-  modelCanvas: ReturnType<Canvas['toObject']>
-  backCanvas: ReturnType<Canvas['toObject']>
+  models: CardModel[]
+  backs: CardBack[]
+  library: LibraryAsset[]
+  activeModelId: string
+  activeBackId: string
   cards: CardState[]
   activeCardId: string
+  cover?: string
 }
+
+type CoverMode = 'off' | 'cover' | 'blur'
+let coverMode: CoverMode = 'blur'
 
 const app = document.querySelector<HTMLDivElement>('#app')
 
@@ -310,21 +350,44 @@ function createEmptyCanvasState(): ReturnType<Canvas['toObject']> {
 }
 
 function createDeckDocument(name = DEFAULT_DECK_NAME): DeckDocument {
+  const model: CardModel = { id: generateDeckId(), name: 'Modelo 1', canvas: createEmptyCanvasState() }
+  const back: CardBack = { id: generateDeckId(), name: 'Verso 1', canvas: createEmptyCanvasState(), thumbnail: '' }
   const firstCard: CardState = {
     id: generateDeckId(),
     name: 'Carta 1',
     deckObjects: [],
+    modelId: model.id,
+    backId: back.id,
     modelOverrides: {},
     thumbnail: '',
   }
   return {
     id: generateDeckId(),
     name,
-    modelCanvas: createEmptyCanvasState(),
-    backCanvas: createEmptyCanvasState(),
+    models: [model],
+    backs: [back],
+    library: [],
+    activeModelId: model.id,
+    activeBackId: back.id,
     cards: [firstCard],
     activeCardId: firstCard.id,
   }
+}
+
+function activeModelOf(deck: DeckDocument): CardModel {
+  return deck.models.find(m => m.id === deck.activeModelId) ?? deck.models[0]
+}
+
+function activeBackOf(deck: DeckDocument): CardBack {
+  return deck.backs.find(b => b.id === deck.activeBackId) ?? deck.backs[0]
+}
+
+function modelOfCard(deck: DeckDocument, card: CardState | undefined): CardModel {
+  return deck.models.find(m => m.id === card?.modelId) ?? deck.models[0]
+}
+
+function backOfCard(deck: DeckDocument, card: CardState | undefined): CardBack {
+  return deck.backs.find(b => b.id === card?.backId) ?? deck.backs[0]
 }
 
 function deepClone<T>(value: T): T {
@@ -1183,7 +1246,7 @@ function createImageBehaviorControls(object: FabricImage): DocumentFragment {
       fileField.value = ''
     }
   })
-  fragment.append(detailsRow('Ilustração carregue uma imagem.', fileField))
+  fragment.append(detailsRow('Trocar imagem', fileField))
 
   const hint = document.createElement('p')
   hint.className = 'layer-note'
@@ -1339,6 +1402,23 @@ async function captureDeckCardThumbnail(deck: DeckDocument, cardId: string): Pro
   return thumbnailCanvas.toDataURL({ format: 'jpeg', quality: 0.35, multiplier: 0.22 })
 }
 
+async function captureBackThumbnail(back: CardBack): Promise<string> {
+  thumbnailCanvas.clear()
+  await thumbnailCanvas.loadFromJSON(back.canvas)
+  thumbnailCanvas.setViewportTransform([1, 0, 0, 1, 0, 0])
+  thumbnailCanvas.requestRenderAll()
+  return thumbnailCanvas.toDataURL({ format: 'jpeg', quality: 0.35, multiplier: 0.22 })
+}
+
+async function captureModelThumbnail(model: CardModel): Promise<string> {
+  thumbnailCanvas.clear()
+  await thumbnailCanvas.loadFromJSON(model.canvas)
+  applyDeckModelImageFit(thumbnailCanvas)
+  thumbnailCanvas.setViewportTransform([1, 0, 0, 1, 0, 0])
+  thumbnailCanvas.requestRenderAll()
+  return thumbnailCanvas.toDataURL({ format: 'jpeg', quality: 0.35, multiplier: 0.22 })
+}
+
 async function refreshDeckThumbnails(deck: DeckDocument): Promise<void> {
   return withLoading(async () => {
     for (const card of deck.cards) {
@@ -1346,6 +1426,14 @@ async function refreshDeckThumbnails(deck: DeckDocument): Promise<void> {
         card.thumbnail = await captureDeckCardThumbnail(deck, card.id)
       } catch {
         card.thumbnail = ''
+      }
+    }
+
+    for (const back of deck.backs) {
+      try {
+        back.thumbnail = await captureBackThumbnail(back)
+      } catch {
+        back.thumbnail = ''
       }
     }
 
@@ -1362,12 +1450,18 @@ function persistActiveDeckDocument(): void {
   const modelObjects = all.filter(o => o.data?.scope === 'model') as unknown[]
 
   if (activeEditMode === 'back') {
-    deck.backCanvas = { ...snapshot }
+    const back = activeBackOf(deck)
+    back.canvas = { ...snapshot }
+    try {
+      back.thumbnail = captureCardThumbnail()
+    } catch {
+      back.thumbnail = ''
+    }
     return
   }
 
   if (activeEditMode === 'model') {
-    deck.modelCanvas = {
+    activeModelOf(deck).canvas = {
       ...snapshot,
       objects: modelObjects as ReturnType<Canvas['toObject']>['objects'],
     }
@@ -1377,7 +1471,7 @@ function persistActiveDeckDocument(): void {
   const card = deck.cards.find(c => c.id === deck.activeCardId)
   if (card) {
     card.modelOverrides = collectCardModelOverrides(
-      (deck.modelCanvas.objects ?? []) as unknown[],
+      (modelOfCard(deck, card).canvas.objects ?? []) as unknown[],
       modelObjects,
     )
     card.deckObjects = all.filter(o => o.data?.scope !== 'model') as unknown[]
@@ -1391,7 +1485,8 @@ function persistActiveDeckDocument(): void {
 
 function buildCardCanvasState(deck: DeckDocument, cardId: string): ReturnType<Canvas['toObject']> {
   const card = deck.cards.find(c => c.id === cardId) ?? deck.cards[0]
-  const modelObjects = deepClone((deck.modelCanvas.objects ?? []) as Array<Record<string, unknown>>)
+  const cardModelCanvas = modelOfCard(deck, card).canvas
+  const modelObjects = deepClone((cardModelCanvas.objects ?? []) as Array<Record<string, unknown>>)
 
   for (const object of modelObjects) {
     const id = layerIdFromSerialized(object)
@@ -1456,7 +1551,7 @@ function buildCardCanvasState(deck: DeckDocument, cardId: string): ReturnType<Ca
   }
 
   return {
-    ...deck.modelCanvas,
+    ...cardModelCanvas,
     objects: [
       ...modelObjects,
       ...((card?.deckObjects ?? []) as ReturnType<Canvas['toObject']>['objects']),
@@ -1470,17 +1565,12 @@ async function loadActiveDeckCard(deck: DeckDocument, cardId?: string): Promise<
   await loadDeckCanvas(buildCardCanvasState(deck, deck.activeCardId))
 }
 
-async function switchToModelView(): Promise<void> {
-  if (activeEditMode === 'model') return
-  persistActiveDeckDocument() // activeEditMode is 'deck' here → saves both model and card
-  activeEditMode = 'model'
-  activeRightPanelTab = 'model-layers'
-  destroySelectedTextEditor()
+async function loadActiveModelIntoEditor(): Promise<void> {
   const deck = currentDeck()
   canvas.clear()
   layerById.clear()
   baseLayerId = ''
-  await canvas.loadFromJSON(deck.modelCanvas)
+  await canvas.loadFromJSON(activeModelOf(deck).canvas)
   canvas.getObjects().forEach(obj => {
     const meta = getLayerMeta(obj)
     if (meta.kind === 'base') baseLayerId = meta.id
@@ -1490,6 +1580,18 @@ async function switchToModelView(): Promise<void> {
   renderLayersAccordion()
   canvas.discardActiveObject()
   canvas.requestRenderAll()
+}
+
+async function switchToModelView(): Promise<void> {
+  if (activeEditMode === 'model') return
+  persistActiveDeckDocument() // activeEditMode is 'deck' here → saves both model and card
+  const deck = currentDeck()
+  const activeCard = deck.cards.find(c => c.id === deck.activeCardId)
+  deck.activeModelId = modelOfCard(deck, activeCard).id
+  activeEditMode = 'model'
+  activeRightPanelTab = 'model-layers'
+  destroySelectedTextEditor()
+  await loadActiveModelIntoEditor()
   renderWorkspaceTabs()
 }
 
@@ -1555,42 +1657,81 @@ function markObjectScope(object: FabricObject, scope: LayerScope): void {
 }
 
 function migrateDeckDocument(raw: Record<string, unknown>): DeckDocument {
-  if (raw['modelCanvas'] && Array.isArray(raw['cards'])) {
-    const deck = raw as unknown as DeckDocument
-    return {
-      ...deck,
-      backCanvas: raw['backCanvas'] as ReturnType<Canvas['toObject']> || createEmptyCanvasState(),
-      cards: deck.cards.map((card, index) => ({
-        id: card.id || generateDeckId(),
-        name: card.name || `Carta ${index + 1}`,
-        deckObjects: Array.isArray(card.deckObjects) ? card.deckObjects : [],
-        modelOverrides: card.modelOverrides && typeof card.modelOverrides === 'object' ? card.modelOverrides : {},
-        thumbnail: card.thumbnail || '',
-      })),
-      activeCardId: deck.activeCardId || deck.cards[0]?.id || '',
-    }
+  let models: CardModel[] = []
+  let backs: CardBack[] = []
+  let rawCards: Array<Partial<CardState>> = []
+
+  if (Array.isArray(raw['models']) && Array.isArray(raw['cards'])) {
+    models = (raw['models'] as Array<Partial<CardModel>>).map((m, i) => ({
+      id: m.id || generateDeckId(),
+      name: m.name || `Modelo ${i + 1}`,
+      canvas: m.canvas || createEmptyCanvasState(),
+    }))
+    backs = (Array.isArray(raw['backs']) ? raw['backs'] as Array<Partial<CardBack>> : []).map((b, i) => ({
+      id: b.id || generateDeckId(),
+      name: b.name || `Verso ${i + 1}`,
+      canvas: b.canvas || createEmptyCanvasState(),
+      thumbnail: b.thumbnail || '',
+    }))
+    rawCards = raw['cards'] as Array<Partial<CardState>>
+  } else if (raw['modelCanvas'] && Array.isArray(raw['cards'])) {
+    models = [{ id: generateDeckId(), name: 'Modelo 1', canvas: raw['modelCanvas'] as ReturnType<Canvas['toObject']> }]
+    backs = [{
+      id: generateDeckId(),
+      name: 'Verso 1',
+      canvas: (raw['backCanvas'] as ReturnType<Canvas['toObject']> | undefined) || createEmptyCanvasState(),
+      thumbnail: '',
+    }]
+    rawCards = raw['cards'] as Array<Partial<CardState>>
+  } else {
+    const oldCanvas = (raw['canvas'] ?? createEmptyCanvasState()) as ReturnType<Canvas['toObject']>
+    const all = (oldCanvas.objects ?? []) as Array<{ data?: Partial<LayerMeta> }>
+    models = [{
+      id: generateDeckId(),
+      name: 'Modelo 1',
+      canvas: {
+        ...oldCanvas,
+        objects: all.filter(o => o.data?.scope === 'model') as ReturnType<Canvas['toObject']>['objects'],
+      },
+    }]
+    rawCards = [{ deckObjects: all.filter(o => o.data?.scope !== 'model') as unknown[] }]
   }
-  const oldCanvas = (raw['canvas'] ?? createEmptyCanvasState()) as ReturnType<Canvas['toObject']>
-  const all = (oldCanvas.objects ?? []) as Array<{ data?: Partial<LayerMeta> }>
-  const modelCanvas = {
-    ...oldCanvas,
-    objects: all.filter(o => o.data?.scope === 'model') as ReturnType<Canvas['toObject']>['objects'],
-  }
-  const deckObjects = all.filter(o => o.data?.scope !== 'model') as unknown[]
-  const firstCard: CardState = {
-    id: generateDeckId(),
-    name: 'Carta 1',
-    deckObjects,
-    modelOverrides: {},
-    thumbnail: '',
-  }
+
+  if (models.length === 0) models.push({ id: generateDeckId(), name: 'Modelo 1', canvas: createEmptyCanvasState() })
+  if (backs.length === 0) backs.push({ id: generateDeckId(), name: 'Verso 1', canvas: createEmptyCanvasState(), thumbnail: '' })
+  if (rawCards.length === 0) rawCards.push({})
+
+  const cards: CardState[] = rawCards.map((card, index) => ({
+    id: card.id || generateDeckId(),
+    name: card.name || `Carta ${index + 1}`,
+    deckObjects: Array.isArray(card.deckObjects) ? card.deckObjects : [],
+    modelId: models.some(m => m.id === card.modelId) ? card.modelId as string : models[0].id,
+    backId: backs.some(b => b.id === card.backId) ? card.backId as string : backs[0].id,
+    modelOverrides: card.modelOverrides && typeof card.modelOverrides === 'object' ? card.modelOverrides : {},
+    thumbnail: card.thumbnail || '',
+  }))
+  const requestedActive = typeof raw['activeCardId'] === 'string' ? raw['activeCardId'] : ''
+  const activeCard = cards.find(c => c.id === requestedActive) ?? cards[0]
+
   return {
     id: (raw['id'] as string | undefined) ?? generateDeckId(),
     name: (raw['name'] as string | undefined) ?? DEFAULT_DECK_NAME,
-    modelCanvas,
-    backCanvas: createEmptyCanvasState(),
-    cards: [firstCard],
-    activeCardId: firstCard.id,
+    models,
+    backs,
+    library: (Array.isArray(raw['library']) ? raw['library'] as Array<Partial<LibraryAsset>> : [])
+      .filter(a => typeof a.src === 'string' && a.src.length > 0)
+      .map((a, i) => ({
+        id: a.id || generateDeckId(),
+        name: a.name || `Gráfico ${i + 1}`,
+        src: a.src as string,
+        width: typeof a.width === 'number' && a.width > 0 ? a.width : 0,
+        height: typeof a.height === 'number' && a.height > 0 ? a.height : 0,
+      })),
+    activeModelId: activeCard.modelId,
+    activeBackId: activeCard.backId,
+    cards,
+    activeCardId: activeCard.id,
+    cover: typeof raw['cover'] === 'string' ? raw['cover'] : '',
   }
 }
 
@@ -1603,16 +1744,22 @@ function deckFileSnapshot(): { version: 1; deck: DeckDocument } {
     deck: {
       id: deck.id,
       name: deck.name,
-      modelCanvas: cloneCanvasState(deck.modelCanvas),
-      backCanvas: cloneCanvasState(deck.backCanvas),
+      models: deck.models.map(m => ({ id: m.id, name: m.name, canvas: cloneCanvasState(m.canvas) })),
+      backs: deck.backs.map(b => ({ id: b.id, name: b.name, canvas: cloneCanvasState(b.canvas), thumbnail: b.thumbnail })),
+      library: deck.library.map(a => ({ ...a })),
+      activeModelId: deck.activeModelId,
+      activeBackId: deck.activeBackId,
       cards: deck.cards.map(c => ({
         id: c.id,
         name: c.name,
         deckObjects: JSON.parse(JSON.stringify(c.deckObjects)) as unknown[],
+        modelId: c.modelId,
+        backId: c.backId,
         modelOverrides: JSON.parse(JSON.stringify(c.modelOverrides)) as Record<string, CardModelOverride>,
         thumbnail: c.thumbnail,
       })),
       activeCardId: deck.activeCardId,
+      cover: deck.cover ?? '',
     },
   }
 }
@@ -1620,9 +1767,15 @@ function deckFileSnapshot(): { version: 1; deck: DeckDocument } {
 app.innerHTML = `
 <main id="editorWorkspace" class="editor-layout">
   <section class="panel tools-panel">
-    <div class="menu-shell">
+    <div class="left-panel-shell">
+    <div class="menu-dropdown">
+      <button id="mainMenuButton" class="menu-trigger" type="button" aria-haspopup="true" aria-expanded="false" aria-controls="mainMenuPanel">
+        <span class="material-symbols-outlined" aria-hidden="true">menu</span>
+        <span class="menu-trigger-label">Deck Studio</span>
+        <span class="material-symbols-outlined menu-trigger-caret" aria-hidden="true">expand_more</span>
+      </button>
+      <div id="mainMenuPanel" class="menu-dropdown-panel menu-shell" hidden>
       <div class="menu-top">
-        <h1 class="menu-brand">Deck Studio</h1>
         <button id="openTemplatesButton" class="template-launch-button" type="button">
           <span class="material-symbols-outlined" aria-hidden="true">style</span>
           <span><strong>Modelos prontos</strong><small>Comece com uma carta completa</small></span>
@@ -1632,6 +1785,15 @@ app.innerHTML = `
           <input id="deckNameInput" type="text" placeholder="Baralho 1" aria-describedby="deckNameHint" />
         </label>
         <p id="deckNameHint" class="hint">A extensão .deck é adicionada ao salvar.</p>
+        <div class="cover-field">
+          <span class="cover-field-label">Capa do deck</span>
+          <div class="cover-field-row">
+            <div id="deckCoverPreview" class="cover-preview" aria-hidden="true"></div>
+            <button id="deckCoverUploadButton" class="ghost tiny" type="button">Escolher</button>
+            <button id="deckCoverRemoveButton" class="ghost tiny" type="button">Remover</button>
+          </div>
+          <input id="deckCoverInput" type="file" accept="image/*" hidden />
+        </div>
         <p class="menu-caption">Ferramentas</p>
       </div>
 
@@ -1647,6 +1809,13 @@ app.innerHTML = `
         <button id="openTutorialButton" class="menu-item" type="button">
           <span class="material-symbols-outlined" aria-hidden="true">school</span>
           <span>Como usar</span>
+        </button>
+      </nav>
+
+      <nav class="menu-list" aria-label="Decks prontos">
+        <button id="openPresetDecksButton" class="menu-item" type="button">
+          <span class="material-symbols-outlined" aria-hidden="true">style</span>
+          <span>Decks prontos</span>
         </button>
       </nav>
 
@@ -1669,12 +1838,81 @@ app.innerHTML = `
         </button>
       </div>
       <input id="importDeckInput" type="file" accept=".deck,application/octet-stream,application/gzip,application/json" hidden />
+      </div>
+    </div>
+
+    <div class="left-scroll">
+      <section id="editSection" class="edit-panel">
+        <h2>Edição</h2>
+        <p class="subtitle compact" id="editItemLabel">Selecione um item da carta para editar.</p>
+        <div id="editPanelContent" class="edit-panel-content"></div>
+      </section>
+      <div id="modelTools" class="model-tools">
+        <div class="control-block">
+          <h2>Fundo da carta</h2>
+          <button id="changeBaseButton" class="ghost" type="button">Trocar fundo</button>
+          <input id="baseImageInput" type="file" accept="image/*" hidden />
+        </div>
+        <div class="control-block">
+          <h2>Adicionar ao modelo</h2>
+          <div class="row two">
+            <button id="addGraphicButton" class="primary" type="button">+ Imagem</button>
+            <button id="addTextButton" class="ghost" type="button">+ Texto</button>
+          </div>
+          <input id="imageInput" type="file" accept="image/*" hidden />
+          <p class="hint">Para trocar uma imagem, selecione-a e dê duplo clique, ou use o painel de edição. Também dá para soltar imagens na carta.</p>
+        </div>
+        <div class="control-block">
+          <h2>Formas</h2>
+          <div id="shapePalette" class="shape-palette">
+            <button class="ghost" type="button" data-shape="rect">Retângulo</button>
+            <button class="ghost" type="button" data-shape="rounded">Arredondado</button>
+            <button class="ghost" type="button" data-shape="ellipse">Círculo</button>
+            <button class="ghost" type="button" data-shape="triangle">Triângulo</button>
+            <button class="ghost" type="button" data-shape="diamond">Losango</button>
+            <button class="ghost" type="button" data-shape="pentagon">Pentágono</button>
+            <button class="ghost" type="button" data-shape="hexagon">Hexágono</button>
+            <button class="ghost" type="button" data-shape="star">Estrela</button>
+            <button class="ghost" type="button" data-shape="line">Linha</button>
+          </div>
+          <p class="hint">Selecione a forma e edite preenchimento, contorno, cantos e tamanho no painel de edição.</p>
+        </div>
+      </div>
+    </div>
+    <div class="library-launcher">
+      <button id="openLibraryButton" class="library-launch-button" type="button">
+        <span class="material-symbols-outlined" aria-hidden="true">collections</span>
+        <span>Biblioteca de gráficos</span>
+      </button>
+    </div>
     </div>
   </section>
+
+  <div id="libraryModal" class="print-modal" hidden>
+    <div id="libraryModalBackdrop" class="print-modal-backdrop"></div>
+    <section class="print-modal-dialog library-modal-dialog" role="dialog" aria-modal="true" aria-labelledby="libraryModalTitle">
+      <header class="print-modal-header">
+        <h2 id="libraryModalTitle">Biblioteca de gráficos</h2>
+        <button id="closeLibraryButton" class="ghost tiny" type="button" aria-label="Fechar biblioteca">Fechar</button>
+      </header>
+      <div class="library-modal-toolbar">
+        <p id="libraryHint" class="hint"></p>
+        <button id="libraryUploadButton" class="primary" type="button">+ Adicionar à biblioteca</button>
+        <input id="libraryInput" type="file" accept="image/*" multiple hidden />
+      </div>
+      <div id="libraryGrid" class="library-grid"></div>
+    </section>
+  </div>
 
   <div id="leftPanelResizer" class="panel-resizer" role="separator" aria-label="Redimensionar painel de ferramentas" aria-orientation="vertical" tabindex="0"></div>
 
   <section class="panel canvas-panel">
+    <div id="canvasCoverBg" class="canvas-cover-bg" aria-hidden="true"></div>
+    <div class="cover-switch" role="group" aria-label="Capa no fundo">
+      <button type="button" data-cover-mode="off" title="Sem capa">Off</button>
+      <button type="button" data-cover-mode="cover" title="Capa no fundo">Capa</button>
+      <button type="button" data-cover-mode="blur" title="Capa com blur">Blur</button>
+    </div>
     <div class="zoom-controls">
       <button id="zoomOutButton" class="ghost tiny" type="button" aria-label="Diminuir zoom">-</button>
       <input id="zoomRange" type="range" min="20" max="400" step="5" value="100" />
@@ -1694,41 +1932,33 @@ app.innerHTML = `
   <div class="right-panel-host">
     <div class="right-panel-tab-bar">
       <button id="editDeckButton" class="tab-button is-active" type="button">Baralho</button>
-      <button id="editSelectionButton" class="tab-button" type="button" hidden>Edição</button>
       <button id="editModelButton" class="tab-button" type="button">Modelo</button>
       <button id="editBackButton" class="tab-button" type="button" title="Background (verso das cartas)">Verso</button>
     </div>
     <section id="cardsSection" class="panel cards-panel">
-      <h2>Miniaturas</h2>
+      <h2>Baralho / Deck</h2>
       <p class="subtitle compact" id="cardCountLabel"></p>
+      <div id="cardVariantControls" class="card-variant-controls">
+        <label>Modelo desta carta<select id="cardModelSelect"></select></label>
+        <label>Verso desta carta<select id="cardBackSelect"></select></label>
+      </div>
       <div id="cardThumbnails" class="card-thumbnails"></div>
       <button id="addCardButton" class="primary" type="button">+ Adicionar carta</button>
     </section>
-    <section id="editSection" class="panel edit-panel" hidden>
-      <h2>Edição</h2>
-      <p class="subtitle compact" id="editItemLabel">Selecione um item da carta para editar.</p>
-      <div id="editPanelContent" class="edit-panel-content"></div>
-    </section>
     <section id="layersSection" class="panel layers-panel" hidden>
-      <h2>Layers</h2>
+      <h2 id="layersSectionTitle">Modelo</h2>
+      <div id="variantBar" class="variant-bar">
+        <input id="variantNameInput" type="text" maxlength="60" aria-label="Nome" placeholder="Nome" />
+        <select id="variantSelect" aria-label="Selecionar variação"></select>
+        <div class="variant-actions">
+          <button id="variantNewButton" class="ghost tiny" type="button">+ Novo</button>
+          <button id="variantDuplicateButton" class="ghost tiny" type="button">Duplicar</button>
+          <button id="variantDeleteButton" class="danger tiny" type="button">Excluir</button>
+        </div>
+      </div>
+      <h3 class="layers-heading">Layers</h3>
       <p class="subtitle compact">Reordene tambem arrastando os blocos.</p>
       <div id="layersAccordion" class="layers-accordion"></div>
-      <div class="control-block">
-        <h2>Elementos</h2>
-        <div class="row two">
-          <button id="addGraphicButton" class="primary" type="button">Adicionar referência</button>
-          <button id="addTextButton" class="ghost" type="button">Adicionar texto</button>
-        </div>
-        <label>
-          Trocar ilustração
-          <input id="imageInput" type="file" accept="image/*" />
-        </label>
-        <label>
-          Imagem da carta base
-          <input id="baseImageInput" type="file" accept="image/*" />
-        </label>
-        <p class="hint">Dica: tambem pode soltar imagens direto na area da carta.</p>
-      </div>
     </section>
   </div>
 </main>
@@ -1787,6 +2017,17 @@ app.innerHTML = `
   <span class="material-symbols-outlined" aria-hidden="true">arrow_upward</span>
   <span>Voltar ao editor</span>
 </button>
+
+<div id="presetDecksModal" class="print-modal" hidden>
+  <div id="presetDecksBackdrop" class="print-modal-backdrop"></div>
+  <section class="print-modal-dialog preset-decks-dialog" role="dialog" aria-modal="true" aria-labelledby="presetDecksTitle">
+    <header class="print-modal-header">
+      <h2 id="presetDecksTitle">Decks prontos</h2>
+      <button id="closePresetDecksButton" class="ghost tiny" type="button" aria-label="Fechar modal">Fechar</button>
+    </header>
+    <ul id="presetDeckList" class="preset-deck-grid"></ul>
+  </section>
+</div>
 
 <div id="printModal" class="print-modal" hidden>
   <div id="printModalBackdrop" class="print-modal-backdrop"></div>
@@ -1890,6 +2131,37 @@ app.innerHTML = `
     </footer>
   </section>
 </div>
+
+<div id="confirmModal" class="templates-modal" hidden>
+  <div id="confirmModalBackdrop" class="templates-modal-backdrop"></div>
+  <section class="templates-modal-dialog confirm-dialog" role="alertdialog" aria-modal="true" aria-labelledby="confirmModalTitle">
+    <h2 id="confirmModalTitle"></h2>
+    <p id="confirmModalMessage"></p>
+    <label id="confirmModalChoiceWrap" class="confirm-choice" hidden>
+      <span id="confirmModalChoiceLabel"></span>
+      <select id="confirmModalChoice"></select>
+    </label>
+    <div class="dialog-actions">
+      <button id="confirmModalCancel" class="ghost" type="button">Cancelar</button>
+      <button id="confirmModalAccept" class="danger" type="button">Confirmar</button>
+    </div>
+  </section>
+</div>
+
+<div id="newCardModal" class="templates-modal" hidden>
+  <div id="newCardModalBackdrop" class="templates-modal-backdrop"></div>
+  <section class="templates-modal-dialog new-card-dialog" role="dialog" aria-modal="true" aria-labelledby="newCardModalTitle">
+    <h2 id="newCardModalTitle">Nova carta</h2>
+    <h3>Modelo</h3>
+    <div id="newCardModels" class="variant-picker"></div>
+    <h3>Verso</h3>
+    <div id="newCardBacks" class="variant-picker"></div>
+    <div class="dialog-actions">
+      <button id="newCardCancel" class="ghost" type="button">Cancelar</button>
+      <button id="newCardCreate" class="primary" type="button">Criar carta</button>
+    </div>
+  </section>
+</div>
 `
 
 function requireElement<T extends Element>(root: ParentNode, selector: string): T {
@@ -1901,17 +2173,63 @@ function requireElement<T extends Element>(root: ParentNode, selector: string): 
 }
 
 const addTextButton = requireElement<HTMLButtonElement>(app, '#addTextButton')
+const shapePalette = requireElement<HTMLDivElement>(app, '#shapePalette')
+const openLibraryButton = requireElement<HTMLButtonElement>(app, '#openLibraryButton')
+const libraryModal = requireElement<HTMLDivElement>(app, '#libraryModal')
+const closeLibraryButton = requireElement<HTMLButtonElement>(app, '#closeLibraryButton')
+const libraryModalBackdrop = requireElement<HTMLDivElement>(app, '#libraryModalBackdrop')
+const libraryUploadButton = requireElement<HTMLButtonElement>(app, '#libraryUploadButton')
+const libraryInput = requireElement<HTMLInputElement>(app, '#libraryInput')
+const libraryGrid = requireElement<HTMLDivElement>(app, '#libraryGrid')
+const libraryHint = requireElement<HTMLParagraphElement>(app, '#libraryHint')
 const addGraphicButton = requireElement<HTMLButtonElement>(app, '#addGraphicButton')
 const imageInput = requireElement<HTMLInputElement>(app, '#imageInput')
 const baseImageInput = requireElement<HTMLInputElement>(app, '#baseImageInput')
+const changeBaseButton = requireElement<HTMLButtonElement>(app, '#changeBaseButton')
+const layersSectionTitle = requireElement<HTMLHeadingElement>(app, '#layersSectionTitle')
+const variantSelect = requireElement<HTMLSelectElement>(app, '#variantSelect')
+const variantNewButton = requireElement<HTMLButtonElement>(app, '#variantNewButton')
+const variantDuplicateButton = requireElement<HTMLButtonElement>(app, '#variantDuplicateButton')
+const variantNameInput = requireElement<HTMLInputElement>(app, '#variantNameInput')
+const confirmModalChoiceWrap = requireElement<HTMLLabelElement>(app, '#confirmModalChoiceWrap')
+const confirmModalChoiceLabel = requireElement<HTMLSpanElement>(app, '#confirmModalChoiceLabel')
+const confirmModalChoice = requireElement<HTMLSelectElement>(app, '#confirmModalChoice')
+const variantDeleteButton = requireElement<HTMLButtonElement>(app, '#variantDeleteButton')
+const cardModelSelect = requireElement<HTMLSelectElement>(app, '#cardModelSelect')
+const cardBackSelect = requireElement<HTMLSelectElement>(app, '#cardBackSelect')
+const confirmModal = requireElement<HTMLDivElement>(app, '#confirmModal')
+const confirmModalBackdrop = requireElement<HTMLDivElement>(app, '#confirmModalBackdrop')
+const confirmModalTitle = requireElement<HTMLHeadingElement>(app, '#confirmModalTitle')
+const confirmModalMessage = requireElement<HTMLParagraphElement>(app, '#confirmModalMessage')
+const confirmModalCancel = requireElement<HTMLButtonElement>(app, '#confirmModalCancel')
+const confirmModalAccept = requireElement<HTMLButtonElement>(app, '#confirmModalAccept')
+const newCardModal = requireElement<HTMLDivElement>(app, '#newCardModal')
+const newCardModalBackdrop = requireElement<HTMLDivElement>(app, '#newCardModalBackdrop')
+const newCardModels = requireElement<HTMLDivElement>(app, '#newCardModels')
+const newCardBacks = requireElement<HTMLDivElement>(app, '#newCardBacks')
+const newCardCancel = requireElement<HTMLButtonElement>(app, '#newCardCancel')
+const newCardCreate = requireElement<HTMLButtonElement>(app, '#newCardCreate')
 const exportDeckButton = requireElement<HTMLButtonElement>(app, '#exportDeckButton')
 const deckNameInput = requireElement<HTMLInputElement>(app, '#deckNameInput')
 const importDeckButton = requireElement<HTMLButtonElement>(app, '#importDeckButton')
+const presetDeckList = requireElement<HTMLUListElement>(app, '#presetDeckList')
+const deckCoverInput = requireElement<HTMLInputElement>(app, '#deckCoverInput')
+const deckCoverUploadButton = requireElement<HTMLButtonElement>(app, '#deckCoverUploadButton')
+const deckCoverRemoveButton = requireElement<HTMLButtonElement>(app, '#deckCoverRemoveButton')
+const deckCoverPreview = requireElement<HTMLDivElement>(app, '#deckCoverPreview')
+const canvasCoverBg = requireElement<HTMLDivElement>(app, '#canvasCoverBg')
+const coverSwitchButtons = Array.from(app.querySelectorAll<HTMLButtonElement>('.cover-switch button'))
+const presetDecksModal = requireElement<HTMLDivElement>(app, '#presetDecksModal')
+const openPresetDecksButton = requireElement<HTMLButtonElement>(app, '#openPresetDecksButton')
+const closePresetDecksButton = requireElement<HTMLButtonElement>(app, '#closePresetDecksButton')
+const presetDecksBackdrop = requireElement<HTMLDivElement>(app, '#presetDecksBackdrop')
 const importDeckInput = requireElement<HTMLInputElement>(app, '#importDeckInput')
 const editModelButton = requireElement<HTMLButtonElement>(app, '#editModelButton')
 const editBackButton = requireElement<HTMLButtonElement>(app, '#editBackButton')
 const editDeckButton = requireElement<HTMLButtonElement>(app, '#editDeckButton')
-const editSelectionButton = requireElement<HTMLButtonElement>(app, '#editSelectionButton')
+const modelTools = requireElement<HTMLDivElement>(app, '#modelTools')
+const mainMenuButton = requireElement<HTMLButtonElement>(app, '#mainMenuButton')
+const mainMenuPanel = requireElement<HTMLDivElement>(app, '#mainMenuPanel')
 const openPrintModalButton = requireElement<HTMLButtonElement>(app, '#openPrintModalButton')
 const printModal = requireElement<HTMLDivElement>(app, '#printModal')
 const printModalBackdrop = requireElement<HTMLDivElement>(app, '#printModalBackdrop')
@@ -1933,7 +2251,6 @@ const exportPngButton = requireElement<HTMLButtonElement>(app, '#exportPngButton
 const canvasStage = requireElement<HTMLDivElement>(app, '#canvasStage')
 const canvasPanel = requireElement<HTMLElement>(app, '.canvas-panel')
 const layersSection = requireElement<HTMLElement>(app, '#layersSection')
-const editSection = requireElement<HTMLElement>(app, '#editSection')
 const editItemLabel = requireElement<HTMLParagraphElement>(app, '#editItemLabel')
 const editPanelContent = requireElement<HTMLDivElement>(app, '#editPanelContent')
 const cardsSection = requireElement<HTMLElement>(app, '#cardsSection')
@@ -1962,7 +2279,7 @@ const openTutorialButton = requireElement<HTMLButtonElement>(app, '#openTutorial
 const tutorialSection = requireElement<HTMLElement>(app, '#tutorialSection')
 const backToEditorButton = requireElement<HTMLButtonElement>(app, '#backToEditorButton')
 
-const PANEL_WIDTHS_STORAGE_KEY = 'deckstudio.panel-widths'
+const PANEL_WIDTHS_STORAGE_KEY = 'deckstudio.panel-widths-v2'
 
 function preferredScrollBehavior(): ScrollBehavior {
   return window.matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth'
@@ -1994,7 +2311,7 @@ function setPanelWidths(left: number, right: number): void {
 function currentPanelWidths(): { left: number; right: number } {
   const styles = getComputedStyle(editorLayout)
   return {
-    left: Number.parseFloat(styles.getPropertyValue('--left-panel-width')) || 220,
+    left: Number.parseFloat(styles.getPropertyValue('--left-panel-width')) || 320,
     right: Number.parseFloat(styles.getPropertyValue('--right-panel-width')) || 360,
   }
 }
@@ -2063,7 +2380,10 @@ async function switchToBackView(): Promise<void> {
   activeEditMode = 'back'
   activeRightPanelTab = 'model-layers'
   destroySelectedTextEditor()
-  await loadDeckCanvas(currentDeck().backCanvas)
+  const deck = currentDeck()
+  const activeCard = deck.cards.find(c => c.id === deck.activeCardId)
+  deck.activeBackId = backOfCard(deck, activeCard).id
+  await loadDeckCanvas(activeBackOf(deck).canvas)
   renderWorkspaceTabs()
 }
 
@@ -2094,7 +2414,7 @@ let layerCount = 0
 let suppressSelectionSync = false
 let draggedLayerId: string | null = null
 let canvasDisplayZoom = 1
-let activeRightPanelTab: 'cards' | 'edit' | 'model-layers' = 'cards'
+let activeRightPanelTab: 'cards' | 'model-layers' = 'cards'
 let selectedTextEditor: Editor | null = null
 
 deckDocuments = [createDeckDocument(DEFAULT_DECK_NAME)]
@@ -2104,8 +2424,6 @@ function renderWorkspaceTabs(): void {
   const modelActive = activeEditMode === 'model'
   const backActive = activeEditMode === 'back'
   const templateActive = modelActive || backActive
-  const selectedObject = canvas.getActiveObject()
-  const showEditTab = activeEditMode === 'deck' && Boolean(selectedObject)
 
   if (templateActive) {
     activeRightPanelTab = 'model-layers'
@@ -2113,52 +2431,69 @@ function renderWorkspaceTabs(): void {
     activeRightPanelTab = 'cards'
   }
 
-  if (!showEditTab && activeRightPanelTab === 'edit') {
-    activeRightPanelTab = 'cards'
-  }
-
   editModelButton.classList.toggle('is-active', modelActive)
   editBackButton.classList.toggle('is-active', backActive)
   editDeckButton.classList.toggle('is-active', activeEditMode === 'deck')
-  editSelectionButton.hidden = !showEditTab
-  editSelectionButton.classList.toggle('is-active', !modelActive && activeRightPanelTab === 'edit')
 
   const showLayers = templateActive
-  const showCards = activeEditMode === 'deck' && activeRightPanelTab === 'cards'
-  const showEdit = activeEditMode === 'deck' && showEditTab && activeRightPanelTab === 'edit'
+  const showCards = activeEditMode === 'deck'
 
   layersSection.hidden = !showLayers
   cardsSection.hidden = !showCards
-  editSection.hidden = !showEdit
   layersSection.classList.toggle('tab-panel-hidden', !showLayers)
   cardsSection.classList.toggle('tab-panel-hidden', !showCards)
-  editSection.classList.toggle('tab-panel-hidden', !showEdit)
+  modelTools.hidden = !templateActive
 
   if (showLayers) {
+    renderVariantBar()
     renderLayersAccordion()
   } else {
     layersAccordion.innerHTML = ''
   }
 
-  if (showEdit) {
-    renderSelectedItemEditor()
-  } else {
-    destroySelectedTextEditor()
-  }
+  renderEditorPanel()
 
   syncModeControls()
-  if (showCards) renderCardThumbnails()
+  renderLibrary()
+  if (showCards) {
+    renderCardVariantControls()
+    renderCardThumbnails()
+  }
+}
+
+function renderEditorPanel(): void {
+  if (activeEditMode === 'deck') {
+    renderSelectedItemEditor()
+    return
+  }
+
+  destroySelectedTextEditor()
+  const selected = canvas.getActiveObject()
+  if (!selected) {
+    editItemLabel.textContent = 'Selecione um layer na carta ou na lista para editar.'
+    renderEditEmptyMessage('Nenhum layer selecionado.')
+    return
+  }
+
+  const meta = getLayerMeta(selected)
+  editItemLabel.textContent = `${meta.name} • ${layerKindLabel(meta.kind)}`
+  editPanelContent.innerHTML = ''
+  const body = document.createElement('div')
+  body.className = 'layer-body'
+  buildLayerBody(selected, meta, meta.kind !== 'base' && meta.scope === activeEditMode, body)
+  editPanelContent.append(body)
 }
 
 function syncModeControls(): void {
   const modelActive = activeEditMode !== 'deck'
   addGraphicButton.disabled = !modelActive
   addTextButton.disabled = !modelActive
-  baseImageInput.disabled = !modelActive
+  shapePalette.querySelectorAll('button').forEach((button) => { button.disabled = !modelActive })
+  changeBaseButton.disabled = !modelActive
 
   addGraphicButton.title = modelActive ? '' : 'No modo Baralho, edite apenas os layers existentes.'
   addTextButton.title = modelActive ? '' : 'No modo Baralho, edite apenas os textos existentes.'
-  baseImageInput.title = modelActive ? '' : 'A carta base so pode ser alterada no modo Modelo.'
+  changeBaseButton.title = modelActive ? '' : 'O fundo so pode ser alterado no modo Modelo.'
 }
 
 function destroySelectedTextEditor(): void {
@@ -2181,7 +2516,8 @@ function selectedDeckEditableObject(): FabricObject | null {
   }
 
   const meta = getLayerMeta(object)
-  const canEdit = meta.scope === 'model' && (meta.kind === 'text' || meta.kind === 'image')
+  const canEdit = (meta.scope === 'model' && (meta.kind === 'text' || meta.kind === 'image'))
+    || (meta.scope === 'deck' && meta.kind === 'graphic')
   return canEdit ? object : null
 }
 
@@ -2330,6 +2666,77 @@ function renderSelectedTextEditor(textObject: FabricText | Textbox): void {
   editPanelContent.append(detailsRow('Alinhamento', alignField))
 }
 
+function createGraphicSizeControls(graphic: FabricObject): DocumentFragment {
+  const fragment = document.createDocumentFragment()
+  const field = (label: string, current: number, apply: (value: number) => void): void => {
+    const input = document.createElement('input')
+    input.type = 'number'
+    input.min = '1'
+    input.max = '4000'
+    input.value = String(Math.round(current))
+    attachNoDragPropagation(input)
+    input.addEventListener('input', () => {
+      const value = Number(input.value)
+      if (value < 1) return
+      apply(value)
+      graphic.setCoords()
+      canvas.requestRenderAll()
+      persistActiveDeckDocument()
+    })
+    fragment.append(detailsRow(label, input))
+  }
+  const naturalWidth = Math.max(1, graphic.width ?? 1)
+  const naturalHeight = Math.max(1, graphic.height ?? 1)
+  field('Largura', naturalWidth * (graphic.scaleX ?? 1), (v) => graphic.set({ scaleX: v / naturalWidth }))
+  field('Altura', naturalHeight * (graphic.scaleY ?? 1), (v) => graphic.set({ scaleY: v / naturalHeight }))
+  return fragment
+}
+
+function renderSelectedGraphicEditor(graphic: FabricObject): void {
+  const commit = (): void => {
+    graphic.setCoords()
+    canvas.requestRenderAll()
+    persistActiveDeckDocument()
+  }
+  const note = document.createElement('p')
+  note.className = 'layer-note'
+  note.textContent = 'Gráfico da biblioteca aplicado apenas nesta carta. Arraste na carta para mover.'
+  editPanelContent.append(note)
+
+  const range = (min: number, max: number, step: number, value: number, onInput: (v: number) => void): HTMLInputElement => {
+    const input = document.createElement('input')
+    input.type = 'range'
+    input.min = String(min)
+    input.max = String(max)
+    input.step = String(step)
+    input.value = String(value)
+    attachNoDragPropagation(input)
+    input.addEventListener('input', () => onInput(Number(input.value)))
+    return input
+  }
+
+  editPanelContent.append(
+    createGraphicSizeControls(graphic),
+    detailsRow('Opacidade', range(0, 1, 0.01, graphic.opacity ?? 1, (v) => { graphic.set({ opacity: v }); commit() })),
+    detailsRow('Escala', range(0.05, 4, 0.01, graphic.scaleX ?? 1, (v) => { graphic.set({ scaleX: v, scaleY: v }); commit() })),
+    detailsRow('Rotação', range(-180, 180, 1, graphic.angle ?? 0, (v) => { graphic.set({ angle: v }); commit() })),
+  )
+
+  const removeButton = document.createElement('button')
+  removeButton.type = 'button'
+  removeButton.className = 'danger'
+  removeButton.textContent = 'Remover da carta'
+  removeButton.addEventListener('click', () => {
+    canvas.remove(graphic)
+    canvas.discardActiveObject()
+    refreshLayerIndex()
+    persistActiveDeckDocument()
+    renderWorkspaceTabs()
+    canvas.requestRenderAll()
+  })
+  editPanelContent.append(removeButton)
+}
+
 function renderSelectedImageEditor(imageObject: FabricImage): void {
   const note = document.createElement('p')
   note.className = 'layer-note'
@@ -2348,7 +2755,13 @@ function renderSelectedItemEditor(): void {
   }
 
   const meta = getLayerMeta(selected)
-  editItemLabel.textContent = `${meta.name} • ${meta.kind === 'text' ? 'Texto' : 'Imagem'}`
+  editItemLabel.textContent = `${meta.name} • ${meta.kind === 'text' ? 'Texto' : meta.kind === 'graphic' ? 'Gráfico' : 'Imagem'}`
+
+  if (meta.kind === 'graphic') {
+    destroySelectedTextEditor()
+    renderSelectedGraphicEditor(selected)
+    return
+  }
 
   if (meta.kind === 'text' && isTextLayer(selected)) {
     renderSelectedTextEditor(selected)
@@ -2369,10 +2782,15 @@ function renderCardThumbnails(): void {
   const previousScrollTop = cardThumbnails.scrollTop
   cardThumbnails.innerHTML = ''
   cardCountLabel.textContent = `${deck.cards.length} carta${deck.cards.length === 1 ? '' : 's'}`
+  renderCardVariantControls()
 
   deck.cards.forEach((card, index) => {
     const item = document.createElement('article')
     item.className = 'card-thumb'
+    const back = backOfCard(deck, card)
+
+    const pair = document.createElement('div')
+    pair.className = 'card-thumb-pair'
 
     const selectBtn = document.createElement('button')
     selectBtn.type = 'button'
@@ -2402,6 +2820,28 @@ function renderCardThumbnails(): void {
 
     selectBtn.addEventListener('click', () => { selectCard(card.id) })
 
+    const backBtn = document.createElement('button')
+    backBtn.type = 'button'
+    backBtn.className = 'card-thumb-back'
+    backBtn.title = `Verso: ${back.name} (clique para alterar)`
+    if (back.thumbnail) {
+      const backImg = document.createElement('img')
+      backImg.src = back.thumbnail
+      backImg.alt = `Verso ${back.name}`
+      backBtn.append(backImg)
+    } else {
+      backBtn.textContent = 'Verso'
+    }
+    backBtn.addEventListener('click', () => {
+      selectCard(card.id)
+      cardBackSelect.focus()
+    })
+    pair.append(selectBtn, backBtn)
+
+    const meta = document.createElement('span')
+    meta.className = 'card-thumb-meta'
+    meta.textContent = `${modelOfCard(deck, card).name} · ${back.name}`
+
     const actions = document.createElement('div')
     actions.className = 'card-thumb-actions'
 
@@ -2424,7 +2864,7 @@ function renderCardThumbnails(): void {
     })
 
     actions.append(duplicateBtn, deleteBtn)
-    item.append(selectBtn, actions)
+    item.append(pair, meta, actions)
     cardThumbnails.append(item)
   })
 
@@ -2467,6 +2907,8 @@ function duplicateCard(cardId: string): void {
     id: generateDeckId(),
     name: `${sourceCard.name} - cópia`,
     deckObjects: deepClone(sourceCard.deckObjects),
+    modelId: sourceCard.modelId,
+    backId: sourceCard.backId,
     modelOverrides: deepClone(sourceCard.modelOverrides),
     thumbnail: sourceCard.thumbnail,
   }
@@ -2480,6 +2922,37 @@ function duplicateCard(cardId: string): void {
 function renderWorkspaceSidebar(): void {
   deckNameInput.value = currentDeck().name
   renderWorkspaceTabs()
+  applyDeckCover()
+}
+
+function applyDeckCover(): void {
+  const cover = currentDeck().cover ?? ''
+  const url = cover ? `url("${cover}")` : ''
+  canvasCoverBg.style.backgroundImage = url
+  deckCoverPreview.style.backgroundImage = url
+  deckCoverRemoveButton.disabled = !cover
+  const active = cover && coverMode !== 'off'
+  canvasPanel.classList.toggle('has-cover', Boolean(active))
+  canvasCoverBg.classList.toggle('is-blur', coverMode === 'blur')
+  coverSwitchButtons.forEach((button) => {
+    button.classList.toggle('is-active', button.dataset.coverMode === coverMode)
+    button.disabled = !cover
+  })
+}
+
+async function resizeCoverDataUrl(file: File): Promise<string> {
+  const bitmap = await createImageBitmap(file)
+  const aspectRatio = 16 / 9
+  const sourceWidth = Math.min(bitmap.width, bitmap.height * aspectRatio)
+  const sourceHeight = sourceWidth / aspectRatio
+  const sourceX = (bitmap.width - sourceWidth) / 2
+  const sourceY = (bitmap.height - sourceHeight) / 2
+  const target = document.createElement('canvas')
+  target.width = 1200
+  target.height = Math.round(target.width / aspectRatio)
+  target.getContext('2d')?.drawImage(bitmap, sourceX, sourceY, sourceWidth, sourceHeight, 0, 0, target.width, target.height)
+  bitmap.close()
+  return target.toDataURL('image/jpeg', 0.85)
 }
 
 async function loadDeckCanvas(state: ReturnType<Canvas['toObject']>): Promise<void> {
@@ -2677,7 +3150,8 @@ function isTextLayer(object: FabricObject): object is FabricText | Textbox {
 }
 
 function layerKindLabel(kind: LayerKind): string {
-  return kind
+  const labels: Record<LayerKind, string> = { base: 'base', image: 'imagem', text: 'texto', shape: 'forma', graphic: 'gráfico' }
+  return labels[kind]
 }
 
 function applyRuntimeConfig(object: FabricObject): void {
@@ -3060,17 +3534,20 @@ function renderLayersAccordion(): void {
       actions.append(removeBtn)
     }
 
-    const body = document.createElement('div')
-    body.className = 'layer-body'
+    details.append(summary, actions)
+    layersAccordion.append(details)
+  })
 
+  renderEditorPanel()
+}
+
+function buildLayerBody(object: FabricObject, meta: LayerMeta, editable: boolean, body: HTMLElement): void {
     if (meta.id === baseLayerId) {
       const lockNote = document.createElement('p')
       lockNote.className = 'layer-note'
       lockNote.textContent =
-        'Layer base bloqueada: use apenas Subir/Descer ou arraste no acordeao para mudar a ordem.'
+        'Layer base bloqueada: use apenas Subir/Descer ou arraste na lista de layers para mudar a ordem.'
       body.append(lockNote)
-      details.append(summary, actions, body)
-      layersAccordion.append(details)
       return
     }
 
@@ -3340,8 +3817,6 @@ function renderLayersAccordion(): void {
           body.append(createImageBehaviorControls(object))
         }
 
-        details.append(summary, actions, body)
-        layersAccordion.append(details)
         return
       }
 
@@ -3352,8 +3827,6 @@ function renderLayersAccordion(): void {
           ? 'Este layer pertence ao modelo. Troque para a aba Modelo para editar.'
           : 'Este layer pertence ao baralho. Troque para a aba Baralhos para editar.'
       body.append(lockNote)
-      details.append(summary, actions, body)
-      layersAccordion.append(details)
       return
     }
 
@@ -3422,6 +3895,14 @@ function renderLayersAccordion(): void {
       canvas.requestRenderAll()
     })
     body.append(detailsRow('Rotacao', angleInput))
+
+    if (meta.kind === 'shape') {
+      body.append(createShapeControls(object))
+    }
+
+    if (meta.kind === 'graphic') {
+      body.append(createGraphicSizeControls(object))
+    }
 
     if (isTextLayer(object)) {
       const textObject = object as FabricText | Textbox
@@ -3681,11 +4162,6 @@ function renderLayersAccordion(): void {
     if (meta.kind === 'image' && object instanceof FabricImage) {
       body.append(createImageBehaviorControls(object))
     }
-
-    details.append(summary, actions, body)
-    layersAccordion.append(details)
-  })
-
 }
 
 async function fileToDataUrl(file: File): Promise<string> {
@@ -3741,7 +4217,7 @@ async function addImageLayer(url: string, name = 'Imagem'): Promise<void> {
   })
 }
 
-async function addGraphicReferenceLayer(name = 'Referência gráfica'): Promise<void> {
+async function addGraphicReferenceLayer(name = 'Imagem'): Promise<void> {
   return withLoading(async () => {
     const svg = encodeURIComponent(`
       <svg xmlns="http://www.w3.org/2000/svg" width="360" height="480" viewBox="0 0 360 480">
@@ -3811,6 +4287,376 @@ function addTextLayer(): void {
   renderLayersAccordion()
   persistActiveDeckDocument()
   canvas.requestRenderAll()
+}
+
+const SHAPE_LABELS: Record<ShapeType, string> = {
+  rect: 'Retângulo',
+  rounded: 'Retângulo arredondado',
+  ellipse: 'Círculo',
+  triangle: 'Triângulo',
+  diamond: 'Losango',
+  pentagon: 'Pentágono',
+  hexagon: 'Hexágono',
+  star: 'Estrela',
+  line: 'Linha',
+}
+
+function polygonPoints(sides: number, radius: number, innerRatio = 1): Array<{ x: number; y: number }> {
+  const count = innerRatio === 1 ? sides : sides * 2
+  return Array.from({ length: count }, (_, index) => {
+    const r = innerRatio !== 1 && index % 2 === 1 ? radius * innerRatio : radius
+    const angle = -Math.PI / 2 + (index * 2 * Math.PI) / count
+    return { x: r * Math.cos(angle), y: r * Math.sin(angle) }
+  })
+}
+
+function createShapeObject(type: ShapeType): FabricObject {
+  const common = {
+    left: CARD_WIDTH * 0.5,
+    top: CARD_HEIGHT * 0.5,
+    originX: 'center' as const,
+    originY: 'center' as const,
+    fill: '#d9b36c',
+    stroke: '#3b2a12',
+    strokeWidth: 4,
+    strokeUniform: true,
+  }
+
+  switch (type) {
+    case 'rect':
+      return new Rect({ ...common, width: 240, height: 160 })
+    case 'rounded':
+      return new Rect({ ...common, width: 240, height: 160, rx: 28, ry: 28 })
+    case 'ellipse':
+      return new Ellipse({ ...common, rx: 100, ry: 100 })
+    case 'triangle':
+      return new Triangle({ ...common, width: 220, height: 190 })
+    case 'diamond':
+      return new Polygon([{ x: 0, y: -120 }, { x: 80, y: 0 }, { x: 0, y: 120 }, { x: -80, y: 0 }], common)
+    case 'pentagon':
+      return new Polygon(polygonPoints(5, 110), common)
+    case 'hexagon':
+      return new Polygon(polygonPoints(6, 110), common)
+    case 'star':
+      return new Polygon(polygonPoints(5, 120, 0.42), common)
+    case 'line':
+      return new Line([0, 0, 260, 0], { ...common, fill: null, strokeWidth: 6, strokeLineCap: 'round' })
+  }
+}
+
+function addShapeLayer(type: ShapeType): void {
+  if (activeEditMode === 'deck') return
+  const shape = createShapeObject(type)
+  setLayerMeta(shape, {
+    id: generateLayerId(),
+    kind: 'shape',
+    name: `${SHAPE_LABELS[type]} ${canvas.getObjects().length}`,
+    scope: activeEditMode,
+  })
+  applyRuntimeConfig(shape)
+  canvas.add(shape)
+  canvas.setActiveObject(shape)
+  refreshLayerIndex()
+  renderLayersAccordion()
+  persistActiveDeckDocument()
+  canvas.requestRenderAll()
+}
+
+function createShapeControls(object: FabricObject): DocumentFragment {
+  const fragment = document.createDocumentFragment()
+  const isLine = object instanceof Line
+
+  const commit = (): void => {
+    object.set('dirty', true)
+    object.setCoords()
+    canvas.requestRenderAll()
+    persistActiveDeckDocument()
+  }
+  const readColor = (value: unknown, fallback: string): { hex: string; alpha: number } => {
+    if (typeof value !== 'string' || !value) return { hex: fallback, alpha: 1 }
+    try {
+      const color = new FabricColor(value)
+      return { hex: `#${color.toHex()}`, alpha: color.getAlpha() }
+    } catch {
+      return { hex: fallback, alpha: 1 }
+    }
+  }
+  const composeColor = (hex: string, alpha: number): string => {
+    const color = new FabricColor(hex)
+    color.setAlpha(alpha)
+    return color.toRgba()
+  }
+  const numberField = (value: number, min: number, max: number, step = 1): HTMLInputElement => {
+    const input = document.createElement('input')
+    input.type = 'number'
+    input.min = String(min)
+    input.max = String(max)
+    input.step = String(step)
+    input.value = String(value)
+    attachNoDragPropagation(input)
+    return input
+  }
+  const colorField = (hex: string): HTMLInputElement => {
+    const input = document.createElement('input')
+    input.type = 'color'
+    input.value = hex
+    attachNoDragPropagation(input)
+    return input
+  }
+  const alphaField = (alpha: number): HTMLInputElement => {
+    const input = document.createElement('input')
+    input.type = 'range'
+    input.min = '0'
+    input.max = '1'
+    input.step = '0.01'
+    input.value = String(alpha)
+    attachNoDragPropagation(input)
+    return input
+  }
+  const checkField = (checked: boolean): HTMLInputElement => {
+    const input = document.createElement('input')
+    input.type = 'checkbox'
+    input.checked = checked
+    attachNoDragPropagation(input)
+    return input
+  }
+  const selectField = (options: Array<[string, string]>, current: string): HTMLSelectElement => {
+    const select = document.createElement('select')
+    options.forEach(([value, label]) => {
+      const option = document.createElement('option')
+      option.value = value
+      option.textContent = label
+      option.selected = value === current
+      select.append(option)
+    })
+    attachNoDragPropagation(select)
+    return select
+  }
+
+  const sizeW = numberField(Math.round((object.width ?? 0) * (object.scaleX ?? 1)), 1, 2000)
+  sizeW.addEventListener('input', () => {
+    const value = Number(sizeW.value)
+    if (value >= 1 && (object.width ?? 0) > 0) {
+      object.set({ scaleX: value / (object.width ?? 1) })
+      commit()
+    }
+  })
+  fragment.append(detailsRow('Largura', sizeW))
+
+  if (!isLine) {
+    const sizeH = numberField(Math.round((object.height ?? 0) * (object.scaleY ?? 1)), 1, 2000)
+    sizeH.addEventListener('input', () => {
+      const value = Number(sizeH.value)
+      if (value >= 1 && (object.height ?? 0) > 0) {
+        object.set({ scaleY: value / (object.height ?? 1) })
+        commit()
+      }
+    })
+    fragment.append(detailsRow('Altura', sizeH))
+  }
+
+  if (object instanceof Rect) {
+    const maxRadius = Math.max(1, Math.floor(Math.min(object.width ?? 0, object.height ?? 0) / 2))
+    const radius = numberField(Math.round(object.rx ?? 0), 0, maxRadius)
+    radius.addEventListener('input', () => {
+      const value = clamp(0, maxRadius, Number(radius.value) || 0)
+      object.set({ rx: value, ry: value })
+      commit()
+    })
+    fragment.append(detailsRow('Raio dos cantos', radius))
+  }
+
+  if (!isLine) {
+    const fill = readColor(object.fill, '#d9b36c')
+    const fillEnabled = checkField(Boolean(object.fill))
+    const fillColor = colorField(fill.hex)
+    const fillAlpha = alphaField(fill.alpha)
+    const applyFill = (): void => {
+      object.set({ fill: fillEnabled.checked ? composeColor(fillColor.value, Number(fillAlpha.value)) : null })
+      commit()
+    }
+    fillEnabled.addEventListener('change', applyFill)
+    fillColor.addEventListener('input', applyFill)
+    fillAlpha.addEventListener('input', applyFill)
+    fragment.append(
+      detailsRow('Preenchimento', fillEnabled),
+      detailsRow('Cor do preenchimento', fillColor),
+      detailsRow('Opacidade do preenchimento', fillAlpha),
+    )
+  }
+
+  const stroke = readColor(object.stroke, '#3b2a12')
+  const currentWidth = object.strokeWidth ?? 0
+  const strokeEnabled = checkField(Boolean(object.stroke) && currentWidth > 0)
+  const strokeColor = colorField(stroke.hex)
+  const strokeAlpha = alphaField(stroke.alpha)
+  const strokeWidth = numberField(currentWidth > 0 ? currentWidth : 4, 0, 120)
+  const dashArray = object.strokeDashArray
+  const currentDash = !dashArray || dashArray.length === 0
+    ? 'solid'
+    : (dashArray[0] > currentWidth * 2 ? 'dashed' : 'dotted')
+  const strokeDash = selectField([['solid', 'Sólido'], ['dashed', 'Tracejado'], ['dotted', 'Pontilhado']], currentDash)
+  const strokeJoin = selectField(
+    [['miter', 'Pontiagudo'], ['round', 'Arredondado'], ['bevel', 'Chanfrado']],
+    object.strokeLineJoin ?? 'miter',
+  )
+  const strokeCap = selectField(
+    [['butt', 'Reta'], ['round', 'Arredondada'], ['square', 'Quadrada']],
+    object.strokeLineCap ?? 'butt',
+  )
+  const applyStroke = (): void => {
+    const width = clamp(0, 120, Number(strokeWidth.value) || 0)
+    const enabled = strokeEnabled.checked && width > 0
+    const dash = strokeDash.value === 'dashed'
+      ? [width * 3, width * 2]
+      : strokeDash.value === 'dotted' ? [width, width * 1.6] : null
+    object.set({
+      stroke: enabled ? composeColor(strokeColor.value, Number(strokeAlpha.value)) : null,
+      strokeWidth: enabled ? width : 0,
+      strokeDashArray: dash,
+      strokeLineJoin: strokeJoin.value as typeof object.strokeLineJoin,
+      strokeLineCap: strokeCap.value as typeof object.strokeLineCap,
+    })
+    commit()
+  }
+  ;[strokeEnabled, strokeDash, strokeJoin, strokeCap].forEach((control) => control.addEventListener('change', applyStroke))
+  ;[strokeColor, strokeAlpha, strokeWidth].forEach((control) => control.addEventListener('input', applyStroke))
+  fragment.append(
+    detailsRow('Contorno', strokeEnabled),
+    detailsRow('Cor do contorno', strokeColor),
+    detailsRow('Opacidade do contorno', strokeAlpha),
+    detailsRow('Espessura do contorno', strokeWidth),
+    detailsRow('Estilo do traço', strokeDash),
+    detailsRow('Junção dos cantos', strokeJoin),
+    detailsRow('Pontas do traço', strokeCap),
+  )
+
+  return fragment
+}
+
+function defaultAssetSize(naturalWidth: number, naturalHeight: number): { width: number; height: number } {
+  const scale = Math.min((CARD_WIDTH * 0.5) / Math.max(1, naturalWidth), (CARD_HEIGHT * 0.5) / Math.max(1, naturalHeight), 1)
+  return { width: Math.max(1, Math.round(naturalWidth * scale)), height: Math.max(1, Math.round(naturalHeight * scale)) }
+}
+
+async function fillMissingAssetSizes(deck: DeckDocument): Promise<void> {
+  const pending = deck.library.filter(a => a.width <= 0 || a.height <= 0)
+  if (pending.length === 0) return
+  for (const asset of pending) {
+    try {
+      const element = await loadImageElement(asset.src)
+      Object.assign(asset, defaultAssetSize(element.naturalWidth || 200, element.naturalHeight || 200))
+    } catch {
+      Object.assign(asset, { width: 200, height: 200 })
+    }
+  }
+  renderLibrary()
+}
+
+function renderLibrary(): void {
+  const deck = currentDeck()
+  void fillMissingAssetSizes(deck)
+  libraryGrid.innerHTML = ''
+  libraryHint.textContent = deck.library.length === 0
+    ? 'Adicione imagens ou gráficos para reutilizar no baralho.'
+    : activeEditMode === 'deck'
+      ? 'Clique para inserir apenas na carta atual.'
+      : activeEditMode === 'back'
+        ? 'Clique para inserir no verso (fixo).'
+        : 'Clique para inserir no modelo (fixo: não editável nas cartas).'
+
+  deck.library.forEach((asset) => {
+    const item = document.createElement('div')
+    item.className = 'library-item'
+
+    const insertBtn = document.createElement('button')
+    insertBtn.type = 'button'
+    insertBtn.className = 'library-insert'
+    insertBtn.title = `Inserir "${asset.name}"`
+    const img = document.createElement('img')
+    img.src = asset.src
+    img.alt = asset.name
+    insertBtn.append(img)
+    insertBtn.addEventListener('click', async () => {
+      await addLibraryGraphic(asset)
+      libraryModal.hidden = true
+    })
+
+    const removeBtn = document.createElement('button')
+    removeBtn.type = 'button'
+    removeBtn.className = 'library-remove'
+    removeBtn.textContent = '×'
+    removeBtn.title = 'Remover da biblioteca (não afeta cartas já usadas)'
+    removeBtn.setAttribute('aria-label', `Remover ${asset.name} da biblioteca`)
+    removeBtn.addEventListener('click', () => {
+      deck.library = deck.library.filter(a => a.id !== asset.id)
+      renderLibrary()
+    })
+
+    item.append(insertBtn, removeBtn)
+
+    const sizeRow = document.createElement('div')
+    sizeRow.className = 'library-size'
+    const sizeInput = (label: string, value: number, onChange: (v: number) => void): HTMLLabelElement => {
+      const wrapper = document.createElement('label')
+      wrapper.textContent = label
+      const input = document.createElement('input')
+      input.type = 'number'
+      input.min = '1'
+      input.max = '4000'
+      input.value = String(value)
+      input.addEventListener('change', () => onChange(Math.max(1, Math.round(Number(input.value) || value))))
+      wrapper.append(input)
+      return wrapper
+    }
+    sizeRow.append(
+      sizeInput('L', asset.width, (v) => { asset.width = v }),
+      sizeInput('A', asset.height, (v) => { asset.height = v }),
+    )
+    item.append(sizeRow)
+    libraryGrid.append(item)
+  })
+}
+
+async function addLibraryGraphic(asset: LibraryAsset): Promise<void> {
+  await withLoading(async () => {
+    const image = await FabricImage.fromURL(asset.src)
+    const naturalSize = defaultAssetSize(image.width ?? 1, image.height ?? 1)
+    const targetWidth = asset.width > 0 ? asset.width : naturalSize.width
+    const targetHeight = asset.height > 0 ? asset.height : naturalSize.height
+    image.set({
+      left: CARD_WIDTH * 0.5,
+      top: CARD_HEIGHT * 0.5,
+      originX: 'center',
+      originY: 'center',
+      scaleX: targetWidth / Math.max(1, image.width ?? 1),
+      scaleY: targetHeight / Math.max(1, image.height ?? 1),
+    })
+    setLayerMeta(image, { id: generateLayerId(), kind: 'graphic', name: asset.name, scope: activeEditMode })
+    applyRuntimeConfig(image)
+    canvas.add(image)
+    canvas.setActiveObject(image)
+    refreshLayerIndex()
+    renderLayersAccordion()
+    persistActiveDeckDocument()
+    canvas.requestRenderAll()
+  })
+  if (activeEditMode === 'deck') renderWorkspaceTabs()
+}
+
+async function addFilesToLibrary(files: FileList): Promise<void> {
+  const deck = currentDeck()
+  for (const file of Array.from(files)) {
+    if (!file.type.startsWith('image/')) continue
+    const src = await fileToDataUrl(file)
+    let size = { width: 200, height: 200 }
+    try {
+      const element = await loadImageElement(src)
+      size = defaultAssetSize(element.naturalWidth || 200, element.naturalHeight || 200)
+    } catch { /* mantém tamanho padrão */ }
+    deck.library.push({ id: generateDeckId(), name: file.name.replace(/\.[^.]+$/, '') || 'Gráfico', src, ...size })
+  }
+  renderLibrary()
 }
 
 function svgDataUrl(svg: string): string {
@@ -3931,6 +4777,9 @@ function createTemplateText(text: string, name: string, options: ConstructorPara
 async function applyCardTemplate(preset: CardTemplatePreset): Promise<void> {
   persistActiveDeckDocument()
   const deck = currentDeck()
+  if (activeEditMode !== 'model') {
+    deck.activeModelId = modelOfCard(deck, deck.cards.find(c => c.id === deck.activeCardId)).id
+  }
   activeEditMode = 'model'
   activeRightPanelTab = 'model-layers'
   destroySelectedTextEditor()
@@ -3960,8 +4809,13 @@ async function applyCardTemplate(preset: CardTemplatePreset): Promise<void> {
     const stats = createTemplateText(preset.stats, 'Atributos', { fontFamily: 'Cinzel Decorative', fontWeight: 'bold', lineHeight: 1, ...layout.stats })
     canvas.add(title, typeLine, rules, stats)
 
-    deck.modelCanvas = canvas.toObject(['data'])
-    deck.cards.forEach((card) => { card.modelOverrides = {}; card.thumbnail = '' })
+    const targetModel = activeModelOf(deck)
+    targetModel.canvas = canvas.toObject(['data'])
+    deck.cards.forEach((card) => {
+      if (card.modelId !== targetModel.id) return
+      card.modelOverrides = {}
+      card.thumbnail = ''
+    })
     refreshLayerIndex()
     canvas.discardActiveObject()
     canvas.requestRenderAll()
@@ -3981,9 +4835,10 @@ function renderTemplateGallery(): void {
     card.style.setProperty('--template-deep', preset.colors[3])
     card.innerHTML = `<div class="template-card-preview layout-${preset.layout}"><div class="template-preview-title">${preset.title}</div><div class="template-preview-art"><span class="material-symbols-outlined">image</span></div><div class="template-preview-type">${preset.typeLine}</div><div class="template-preview-copy">Texto de regras e habilidades da carta.</div><div class="template-preview-stat">${preset.stats}</div></div><div class="template-card-content"><span class="template-family">${preset.family}</span><h3>${preset.name}</h3><p>${preset.description}</p><button class="primary template-apply" type="button">Usar este modelo</button></div>`
     card.querySelector<HTMLButtonElement>('.template-apply')?.addEventListener('click', async () => {
+      const deck = currentDeck()
       const hasModel = activeEditMode === 'model'
         ? canvas.getObjects().length > 0
-        : ((currentDeck().modelCanvas.objects ?? []) as unknown[]).length > 0
+        : ((modelOfCard(deck, deck.cards.find(c => c.id === deck.activeCardId)).canvas.objects ?? []) as unknown[]).length > 0
       if (hasModel && !window.confirm('Aplicar este modelo substituirá o layout atual da frente. Continuar?')) return
       templatesModal.hidden = true
       try {
@@ -4069,20 +4924,374 @@ async function replaceBaseLayer(url: string): Promise<void> {
   })
 }
 
-function addNewCard(): void {
+function createCard(modelId: string, backId: string): void {
   persistActiveDeckDocument()
   const deck = currentDeck()
   const newCard: CardState = {
     id: generateDeckId(),
     name: `Carta ${deck.cards.length + 1}`,
     deckObjects: [],
+    modelId,
+    backId,
     modelOverrides: {},
     thumbnail: '',
   }
   deck.cards.push(newCard)
   deck.activeCardId = newCard.id
-  void loadActiveDeckCard(deck, newCard.id)
-  renderCardThumbnails()
+  void loadActiveDeckCard(deck, newCard.id).then(async () => {
+    await refreshDeckThumbnails(deck)
+  })
+  renderWorkspaceTabs()
+}
+
+interface ConfirmChoice {
+  label: string
+  options: Array<{ value: string; label: string; acceptLabel?: string }>
+}
+
+function openConfirm(
+  title: string,
+  message: string,
+  acceptLabel: string,
+  choice?: ConfirmChoice,
+): Promise<{ ok: boolean; choice: string }> {
+  return new Promise((resolve) => {
+    confirmModalTitle.textContent = title
+    confirmModalMessage.textContent = message
+    confirmModalAccept.textContent = acceptLabel
+    confirmModalChoiceWrap.hidden = !choice
+    confirmModalChoice.innerHTML = ''
+    if (choice) {
+      confirmModalChoiceLabel.textContent = choice.label
+      choice.options.forEach((item) => {
+        const option = document.createElement('option')
+        option.value = item.value
+        option.textContent = item.label
+        confirmModalChoice.append(option)
+      })
+    }
+    const syncAcceptLabel = (): void => {
+      const selected = choice?.options.find(o => o.value === confirmModalChoice.value)
+      confirmModalAccept.textContent = selected?.acceptLabel ?? acceptLabel
+    }
+    syncAcceptLabel()
+    confirmModal.hidden = false
+    confirmModalAccept.focus()
+
+    const finish = (ok: boolean): void => {
+      confirmModal.hidden = true
+      confirmModalAccept.removeEventListener('click', onAccept)
+      confirmModalCancel.removeEventListener('click', onCancel)
+      confirmModalBackdrop.removeEventListener('click', onCancel)
+      confirmModalChoice.removeEventListener('change', syncAcceptLabel)
+      window.removeEventListener('keydown', onKey)
+      resolve({ ok, choice: confirmModalChoice.value })
+    }
+    const onAccept = (): void => finish(true)
+    const onCancel = (): void => finish(false)
+    const onKey = (event: KeyboardEvent): void => {
+      if (event.key === 'Escape') finish(false)
+    }
+    confirmModalAccept.addEventListener('click', onAccept)
+    confirmModalCancel.addEventListener('click', onCancel)
+    confirmModalBackdrop.addEventListener('click', onCancel)
+    confirmModalChoice.addEventListener('change', syncAcceptLabel)
+    window.addEventListener('keydown', onKey)
+  })
+}
+
+async function confirmDialog(title: string, message: string, acceptLabel: string): Promise<boolean> {
+  return (await openConfirm(title, message, acceptLabel)).ok
+}
+
+function variantList(): Array<CardModel | CardBack> {
+  const deck = currentDeck()
+  return activeEditMode === 'back' ? deck.backs : deck.models
+}
+
+function renderVariantBar(): void {
+  const deck = currentDeck()
+  const isBack = activeEditMode === 'back'
+  const items = variantList()
+  const activeId = isBack ? deck.activeBackId : deck.activeModelId
+  layersSectionTitle.textContent = isBack ? 'Verso' : 'Modelo'
+  variantSelect.innerHTML = ''
+  items.forEach((item) => {
+    const option = document.createElement('option')
+    option.value = item.id
+    option.textContent = item.name
+    option.selected = item.id === activeId
+    variantSelect.append(option)
+  })
+  variantDeleteButton.disabled = items.length <= 1
+  variantNameInput.value = items.find(item => item.id === activeId)?.name ?? ''
+  variantNameInput.placeholder = isBack ? 'Nome do verso' : 'Nome do modelo'
+  variantNewButton.title = isBack ? 'Criar um novo verso' : 'Criar um novo modelo'
+}
+
+async function switchVariant(id: string): Promise<void> {
+  const deck = currentDeck()
+  persistActiveDeckDocument()
+  if (activeEditMode === 'back') {
+    deck.activeBackId = id
+    destroySelectedTextEditor()
+    await loadDeckCanvas(activeBackOf(deck).canvas)
+  } else {
+    deck.activeModelId = id
+    destroySelectedTextEditor()
+    await loadActiveModelIntoEditor()
+  }
+  renderWorkspaceTabs()
+}
+
+async function addVariant(): Promise<void> {
+  const deck = currentDeck()
+  persistActiveDeckDocument()
+  if (activeEditMode === 'back') {
+    const back: CardBack = { id: generateDeckId(), name: `Verso ${deck.backs.length + 1}`, canvas: createEmptyCanvasState(), thumbnail: '' }
+    deck.backs.push(back)
+    await switchVariant(back.id)
+    return
+  }
+  const model: CardModel = { id: generateDeckId(), name: `Modelo ${deck.models.length + 1}`, canvas: createEmptyCanvasState() }
+  deck.models.push(model)
+  await switchVariant(model.id)
+  renderTemplateGallery()
+  templatesModal.hidden = false
+}
+
+async function duplicateVariant(): Promise<void> {
+  const deck = currentDeck()
+  persistActiveDeckDocument()
+  if (activeEditMode === 'back') {
+    const source = activeBackOf(deck)
+    const copy: CardBack = { ...source, id: generateDeckId(), name: `${source.name} - cópia`, canvas: cloneCanvasState(source.canvas) }
+    deck.backs.push(copy)
+    await switchVariant(copy.id)
+    return
+  }
+  const source = activeModelOf(deck)
+  const copy: CardModel = { id: generateDeckId(), name: `${source.name} - cópia`, canvas: cloneCanvasState(source.canvas) }
+  deck.models.push(copy)
+  await switchVariant(copy.id)
+}
+
+function renameVariant(): void {
+  const deck = currentDeck()
+  const item = activeEditMode === 'back' ? activeBackOf(deck) : activeModelOf(deck)
+  const next = variantNameInput.value.trim()
+  if (!next) return
+  item.name = next
+  const option = Array.from(variantSelect.options).find(o => o.value === item.id)
+  if (option) option.textContent = next
+}
+
+async function deleteVariant(): Promise<void> {
+  const deck = currentDeck()
+  persistActiveDeckDocument()
+
+  if (activeEditMode === 'back') {
+    if (deck.backs.length <= 1) return
+    const target = activeBackOf(deck)
+    const affected = deck.cards.filter(c => c.backId === target.id).length
+    const others = deck.backs.filter(b => b.id !== target.id)
+    const result = await openConfirm(
+      'Excluir verso',
+      affected > 0
+        ? `O verso "${target.name}" será excluído. Escolha qual verso as ${affected} carta(s) que o usavam passarão a usar.`
+        : `O verso "${target.name}" será excluído.`,
+      'Excluir verso',
+      affected > 0
+        ? { label: 'Mudar cartas para', options: others.map(b => ({ value: b.id, label: b.name })) }
+        : undefined,
+    )
+    if (!result.ok) return
+    deck.backs = deck.backs.filter(b => b.id !== target.id)
+    const fallback = deck.backs.find(b => b.id === result.choice) ?? deck.backs[0]
+    deck.cards.forEach((card) => { if (card.backId === target.id) card.backId = fallback.id })
+    await switchVariant(fallback.id)
+    return
+  }
+
+  if (deck.models.length <= 1) return
+  const target = activeModelOf(deck)
+  const affected = deck.cards.filter(c => c.modelId === target.id).length
+  const otherModels = deck.models.filter(m => m.id !== target.id)
+  const DELETE_CARDS = '__delete__'
+  const result = await openConfirm(
+    'Excluir modelo',
+    affected > 0
+      ? `O modelo "${target.name}" será excluído. Escolha o que fazer com as ${affected} carta(s) que o usam. Esta ação não pode ser desfeita.`
+      : `O modelo "${target.name}" será excluído. Esta ação não pode ser desfeita.`,
+    'Excluir modelo',
+    affected > 0
+      ? {
+        label: 'Cartas deste modelo',
+        options: [
+          { value: DELETE_CARDS, label: `Excluir as ${affected} carta(s)`, acceptLabel: 'Excluir modelo e cartas' },
+          ...otherModels.map(m => ({ value: m.id, label: `Mudar para "${m.name}"`, acceptLabel: 'Excluir modelo e mudar cartas' })),
+        ],
+      }
+      : undefined,
+  )
+  if (!result.ok) return
+
+  const destination = deck.models.find(m => m.id === result.choice && m.id !== target.id)
+  deck.models = deck.models.filter(m => m.id !== target.id)
+  if (destination) {
+    const destinationIds = new Set(((destination.canvas.objects ?? []) as unknown[]).map(layerIdFromSerialized).filter(Boolean))
+    deck.cards.forEach((card) => {
+      if (card.modelId !== target.id) return
+      card.modelId = destination.id
+      card.modelOverrides = Object.fromEntries(Object.entries(card.modelOverrides).filter(([id]) => destinationIds.has(id)))
+    })
+  } else {
+    deck.cards = deck.cards.filter(c => c.modelId !== target.id)
+  }
+  const fallback = destination ?? deck.models[0]
+  if (deck.cards.length === 0) {
+    deck.cards.push({
+      id: generateDeckId(),
+      name: 'Carta 1',
+      deckObjects: [],
+      modelId: fallback.id,
+      backId: deck.backs[0].id,
+      modelOverrides: {},
+      thumbnail: '',
+    })
+  }
+  if (!deck.cards.some(c => c.id === deck.activeCardId)) deck.activeCardId = deck.cards[0].id
+  deck.activeModelId = fallback.id
+  destroySelectedTextEditor()
+  await loadActiveModelIntoEditor()
+  await refreshDeckThumbnails(deck)
+  renderWorkspaceTabs()
+}
+
+function renderCardVariantControls(): void {
+  const deck = currentDeck()
+  const card = deck.cards.find(c => c.id === deck.activeCardId)
+  const fill = (select: HTMLSelectElement, items: Array<CardModel | CardBack>, current: string): void => {
+    select.innerHTML = ''
+    items.forEach((item) => {
+      const option = document.createElement('option')
+      option.value = item.id
+      option.textContent = item.name
+      option.selected = item.id === current
+      select.append(option)
+    })
+  }
+  fill(cardModelSelect, deck.models, card?.modelId ?? '')
+  fill(cardBackSelect, deck.backs, card?.backId ?? '')
+}
+
+async function changeActiveCardModel(modelId: string): Promise<void> {
+  persistActiveDeckDocument()
+  const deck = currentDeck()
+  const card = deck.cards.find(c => c.id === deck.activeCardId)
+  const next = deck.models.find(m => m.id === modelId)
+  if (!card || !next || card.modelId === modelId) return
+
+  const nextIds = new Set(((next.canvas.objects ?? []) as unknown[]).map(layerIdFromSerialized).filter(Boolean))
+  const lost = Object.keys(card.modelOverrides).filter(id => !nextIds.has(id))
+  if (lost.length > 0) {
+    const ok = await confirmDialog(
+      'Trocar modelo da carta',
+      `${lost.length} personalização(ões) desta carta não existem no modelo "${next.name}" e serão descartadas.`,
+      'Trocar modelo',
+    )
+    if (!ok) {
+      renderCardVariantControls()
+      return
+    }
+  }
+  card.modelOverrides = Object.fromEntries(Object.entries(card.modelOverrides).filter(([id]) => nextIds.has(id)))
+  card.modelId = modelId
+  deck.activeModelId = modelId
+  await loadActiveDeckCard(deck, card.id)
+  await refreshDeckThumbnails(deck)
+  renderWorkspaceTabs()
+}
+
+function changeActiveCardBack(backId: string): void {
+  const deck = currentDeck()
+  const card = deck.cards.find(c => c.id === deck.activeCardId)
+  if (!card || card.backId === backId) return
+  card.backId = backId
+  renderWorkspaceTabs()
+}
+
+async function addNewCard(): Promise<void> {
+  persistActiveDeckDocument()
+  const deck = currentDeck()
+  const activeCard = deck.cards.find(c => c.id === deck.activeCardId)
+  if (deck.models.length === 1 && deck.backs.length === 1) {
+    createCard(deck.models[0].id, deck.backs[0].id)
+    return
+  }
+
+  let selectedModelId = modelOfCard(deck, activeCard).id
+  let selectedBackId = backOfCard(deck, activeCard).id
+  const modelThumbs = new Map<string, string>()
+  await withLoading(async () => {
+    for (const model of deck.models) {
+      try {
+        modelThumbs.set(model.id, await captureModelThumbnail(model))
+      } catch {
+        modelThumbs.set(model.id, '')
+      }
+    }
+  })
+
+  const renderPicker = (
+    host: HTMLElement,
+    items: Array<CardModel | CardBack>,
+    thumb: (item: CardModel | CardBack) => string,
+    getSelected: () => string,
+    select: (id: string) => void,
+  ): void => {
+    host.innerHTML = ''
+    items.forEach((item) => {
+      const button = document.createElement('button')
+      button.type = 'button'
+      button.className = `variant-option ${item.id === getSelected() ? 'is-active' : ''}`
+      const src = thumb(item)
+      if (src) {
+        const img = document.createElement('img')
+        img.src = src
+        img.alt = item.name
+        button.append(img)
+      }
+      const label = document.createElement('span')
+      label.textContent = item.name
+      button.append(label)
+      button.addEventListener('click', () => {
+        select(item.id)
+        renderAll()
+      })
+      host.append(button)
+    })
+  }
+  const renderAll = (): void => {
+    renderPicker(newCardModels, deck.models, m => modelThumbs.get(m.id) ?? '', () => selectedModelId, (id) => { selectedModelId = id })
+    renderPicker(newCardBacks, deck.backs, b => (b as CardBack).thumbnail, () => selectedBackId, (id) => { selectedBackId = id })
+  }
+  renderAll()
+  newCardModal.hidden = false
+
+  const close = (): void => {
+    newCardModal.hidden = true
+    newCardCreate.removeEventListener('click', onCreate)
+    newCardCancel.removeEventListener('click', close)
+    newCardModalBackdrop.removeEventListener('click', close)
+  }
+  const onCreate = (): void => {
+    close()
+    createCard(selectedModelId, selectedBackId)
+  }
+  newCardCreate.addEventListener('click', onCreate)
+  newCardCancel.addEventListener('click', close)
+  newCardModalBackdrop.addEventListener('click', close)
 }
 
 function selectCard(cardId: string): void {
@@ -4132,6 +5341,7 @@ async function importDeckFile(file: File): Promise<void> {
     })
     deckDocuments = [deck]
     activeDeckId = deck.id
+    coverMode = 'blur'
     activeEditMode = 'deck'
     await loadActiveDeckCard(deck)
     await refreshDeckThumbnails(deck)
@@ -4244,9 +5454,9 @@ async function captureDeckCardPrintImage(deck: DeckDocument, cardId: string): Pr
   return thumbnailCanvas.toDataURL({ format: 'png', multiplier: 1 })
 }
 
-async function captureDeckBackPrintImage(deck: DeckDocument): Promise<string> {
+async function captureDeckBackPrintImage(back: CardBack): Promise<string> {
   thumbnailCanvas.clear()
-  await thumbnailCanvas.loadFromJSON(deck.backCanvas)
+  await thumbnailCanvas.loadFromJSON(back.canvas)
   thumbnailCanvas.setViewportTransform([1, 0, 0, 1, 0, 0])
   thumbnailCanvas.requestRenderAll()
   return thumbnailCanvas.toDataURL({ format: 'png', multiplier: 1 })
@@ -4282,9 +5492,13 @@ async function generateDeckPrintSheets(downloadFormat: 'zip' | 'pdf'): Promise<v
       )
       const imageElements = await Promise.all(cardImages.map(async (src) => loadImageElement(src)))
       const includeBack = printIncludeBackSwitch.checked
-      const backImage = includeBack
-        ? await loadImageElement(await captureDeckBackPrintImage(deck))
-        : null
+      const backImages = new Map<string, HTMLImageElement>()
+      if (includeBack) {
+        for (const backId of new Set(deck.cards.map(c => c.backId))) {
+          const back = deck.backs.find(b => b.id === backId) ?? deck.backs[0]
+          backImages.set(backId, await loadImageElement(await captureDeckBackPrintImage(back)))
+        }
+      }
 
       const totalPages = Math.ceil(deck.cards.length / layout.perSheet)
       const paperWidthPx = mmToPx(layout.paper.widthMm)
@@ -4325,7 +5539,7 @@ async function generateDeckPrintSheets(downloadFormat: 'zip' | 'pdf'): Promise<v
             const col = side === 'verso' ? layout.columns - 1 - frontCol : frontCol
             const x = marginPx + col * (cardWidthPx + gapPx)
             const y = marginPx + row * (cardHeightPx + gapPx)
-            const printImage = side === 'verso' ? backImage : imageElements[cardIndex]
+            const printImage = side === 'verso' ? backImages.get(deck.cards[cardIndex].backId) : imageElements[cardIndex]
             if (!printImage) throw new Error('Falha ao preparar o verso para impressao.')
             context.drawImage(printImage, x, y, cardWidthPx, cardHeightPx)
           }
@@ -4537,13 +5751,6 @@ editDeckButton.addEventListener('click', () => {
   }
   void switchToCardView()
 })
-editSelectionButton.addEventListener('click', () => {
-  if (activeEditMode !== 'deck') {
-    return
-  }
-  activeRightPanelTab = 'edit'
-  renderWorkspaceTabs()
-})
 exportDeckButton.addEventListener('click', saveActiveDeckAsFile)
 deckNameInput.addEventListener('input', () => {
   currentDeck().name = deckNameInput.value
@@ -4559,9 +5766,139 @@ editBackButton.addEventListener('click', () => {
 })
 deckNameInput.addEventListener('change', syncDeckFilename)
 
+variantSelect.addEventListener('change', () => { void switchVariant(variantSelect.value) })
+variantNewButton.addEventListener('click', () => { void addVariant() })
+variantDuplicateButton.addEventListener('click', () => { void duplicateVariant() })
+variantNameInput.addEventListener('input', renameVariant)
+variantDeleteButton.addEventListener('click', () => { void deleteVariant() })
+cardModelSelect.addEventListener('change', () => { void changeActiveCardModel(cardModelSelect.value) })
+cardBackSelect.addEventListener('change', () => { changeActiveCardBack(cardBackSelect.value) })
+changeBaseButton.addEventListener('click', () => { baseImageInput.click() })
+
 importDeckButton.addEventListener('click', () => {
   importDeckInput.click()
 })
+
+interface PresetDeckEntry { name: string; file: string; description?: string }
+
+const presetCoverCache = new Map<string, Promise<string>>()
+
+function fetchPresetCover(file: string): Promise<string> {
+  let cached = presetCoverCache.get(file)
+  if (!cached) {
+    cached = (async () => {
+      const res = await fetch(presetDeckUrl(file))
+      if (!res.ok) return ''
+      const parsed = JSON.parse(await decompressDeckText(new File([await res.blob()], file))) as Record<string, unknown>
+      const deck = (parsed['deck'] ?? parsed) as Record<string, unknown>
+      return typeof deck['cover'] === 'string' ? deck['cover'] : ''
+    })().catch(() => '')
+    presetCoverCache.set(file, cached)
+  }
+  return cached
+}
+
+deckCoverUploadButton.addEventListener('click', () => { deckCoverInput.click() })
+deckCoverInput.addEventListener('change', async () => {
+  const file = deckCoverInput.files?.[0]
+  deckCoverInput.value = ''
+  if (!file) return
+  try {
+    currentDeck().cover = await resizeCoverDataUrl(file)
+    applyDeckCover()
+  } catch {
+    window.alert('Falha ao carregar a capa.')
+  }
+})
+deckCoverRemoveButton.addEventListener('click', () => {
+  currentDeck().cover = ''
+  applyDeckCover()
+})
+coverSwitchButtons.forEach((button) => {
+  button.addEventListener('click', () => {
+    coverMode = button.dataset.coverMode as CoverMode
+    applyDeckCover()
+  })
+})
+applyDeckCover()
+
+function presetDeckUrl(file: string): string {
+  return `${import.meta.env.BASE_URL}decks/${encodeURIComponent(file)}`
+}
+
+async function loadPresetDecks(): Promise<void> {
+  presetDeckList.replaceChildren()
+  try {
+    const response = await fetch(`${import.meta.env.BASE_URL}decks/index.json`, { cache: 'no-cache' })
+    if (!response.ok) throw new Error('manifest')
+    const entries = (await response.json()) as PresetDeckEntry[]
+    if (!Array.isArray(entries) || entries.length === 0) throw new Error('empty')
+
+    for (const entry of entries) {
+      const li = document.createElement('li')
+      li.className = 'preset-deck-item'
+
+      const cover = document.createElement('div')
+      cover.className = 'preset-deck-cover'
+      void fetchPresetCover(entry.file).then((src) => {
+        if (src) cover.style.backgroundImage = `url("${src}")`
+      })
+      li.append(cover)
+
+      const info = document.createElement('div')
+      info.className = 'preset-deck-info'
+      const title = document.createElement('strong')
+      title.textContent = entry.name
+      info.append(title)
+      if (entry.description) {
+        const desc = document.createElement('span')
+        desc.textContent = entry.description
+        info.append(desc)
+      }
+
+      const actions = document.createElement('div')
+      actions.className = 'preset-deck-actions'
+
+      const editBtn = document.createElement('button')
+      editBtn.type = 'button'
+      editBtn.className = 'preset-deck-btn'
+      editBtn.textContent = 'Editar'
+      editBtn.addEventListener('click', async () => {
+        try {
+          const res = await fetch(presetDeckUrl(entry.file))
+          if (!res.ok) throw new Error('Não foi possível carregar o deck.')
+          const blob = await res.blob()
+          await importDeckFile(new File([blob], `${entry.name}.deck`))
+          presetDecksModal.hidden = true
+        } catch (error) {
+          window.alert(error instanceof Error ? error.message : 'Falha ao carregar deck.')
+        }
+      })
+
+      const link = document.createElement('a')
+      link.className = 'preset-deck-btn'
+      link.href = presetDeckUrl(entry.file)
+      link.download = `${entry.name}.deck`
+      link.textContent = 'Baixar'
+
+      actions.append(editBtn, link)
+      li.append(info, actions)
+      presetDeckList.append(li)
+    }
+  } catch {
+    const li = document.createElement('li')
+    li.className = 'hint'
+    li.textContent = 'Nenhum deck disponível.'
+    presetDeckList.replaceChildren(li)
+  }
+}
+
+openPresetDecksButton.addEventListener('click', () => {
+  presetDecksModal.hidden = false
+  void loadPresetDecks()
+})
+closePresetDecksButton.addEventListener('click', () => { presetDecksModal.hidden = true })
+presetDecksBackdrop.addEventListener('click', () => { presetDecksModal.hidden = true })
 
 importDeckInput.addEventListener('change', async () => {
   const file = importDeckInput.files?.[0]
@@ -4578,7 +5915,7 @@ importDeckInput.addEventListener('change', async () => {
   }
 })
 
-addCardButton.addEventListener('click', addNewCard)
+addCardButton.addEventListener('click', () => { void addNewCard() })
 
 addGraphicButton.addEventListener('click', () => {
   if (activeEditMode === 'deck') {
@@ -4586,6 +5923,31 @@ addGraphicButton.addEventListener('click', () => {
     return
   }
   void addGraphicReferenceLayer()
+})
+
+openLibraryButton.addEventListener('click', () => {
+  renderLibrary()
+  libraryModal.hidden = false
+})
+closeLibraryButton.addEventListener('click', () => { libraryModal.hidden = true })
+libraryModalBackdrop.addEventListener('click', () => { libraryModal.hidden = true })
+libraryUploadButton.addEventListener('click', () => { libraryInput.click() })
+libraryInput.addEventListener('change', async () => {
+  const files = libraryInput.files
+  if (!files || files.length === 0) return
+  try {
+    await addFilesToLibrary(files)
+  } catch {
+    window.alert('Falha ao adicionar imagem à biblioteca.')
+  } finally {
+    libraryInput.value = ''
+  }
+})
+
+shapePalette.addEventListener('click', (event) => {
+  const button = (event.target as HTMLElement).closest<HTMLButtonElement>('button[data-shape]')
+  if (!button || button.disabled) return
+  addShapeLayer(button.dataset.shape as ShapeType)
 })
 
 addTextButton.addEventListener('click', () => {
@@ -4646,6 +6008,28 @@ openPrintModalButton.addEventListener('click', () => {
   openPrintModal()
 })
 
+function setMainMenuOpen(open: boolean): void {
+  mainMenuPanel.hidden = !open
+  mainMenuButton.setAttribute('aria-expanded', String(open))
+}
+
+mainMenuButton.addEventListener('click', () => { setMainMenuOpen(mainMenuPanel.hidden === true) })
+mainMenuPanel.addEventListener('click', (event) => {
+  if ((event.target as HTMLElement).closest('.menu-item, .menu-cta, .template-launch-button')) setMainMenuOpen(false)
+})
+document.addEventListener('click', (event) => {
+  if (!mainMenuPanel.hidden && !(event.target as HTMLElement).closest('.menu-dropdown')) setMainMenuOpen(false)
+})
+window.addEventListener('keydown', (event) => {
+  if (event.key === 'Escape' && !libraryModal.hidden) {
+    libraryModal.hidden = true
+  }
+  if (event.key === 'Escape' && !mainMenuPanel.hidden) {
+    setMainMenuOpen(false)
+    mainMenuButton.focus()
+  }
+})
+
 openTemplatesButton.addEventListener('click', () => {
   renderTemplateGallery()
   templatesModal.hidden = false
@@ -4681,11 +6065,17 @@ generateDeckPrintPdfButton.addEventListener('click', () => {
 })
 
 window.addEventListener('keydown', (event) => {
+  if (event.key === 'Escape' && !presetDecksModal.hidden) {
+    presetDecksModal.hidden = true
+  }
   if (event.key === 'Escape' && !printModal.hidden) {
     closePrintModal()
   }
   if (event.key === 'Escape' && !templatesModal.hidden) {
     templatesModal.hidden = true
+  }
+  if (event.key === 'Escape' && !newCardModal.hidden) {
+    newCardModal.hidden = true
   }
 })
 
@@ -4748,10 +6138,7 @@ canvas.on('selection:created', () => {
       renderLayersAccordion()
       return
     }
-    if (activeRightPanelTab !== 'edit') {
-      activeRightPanelTab = 'edit'
-    }
-    renderWorkspaceTabs()
+    renderEditorPanel()
   }
 })
 
@@ -4761,10 +6148,7 @@ canvas.on('selection:updated', () => {
       renderLayersAccordion()
       return
     }
-    if (activeRightPanelTab !== 'edit') {
-      activeRightPanelTab = 'edit'
-    }
-    renderWorkspaceTabs()
+    renderEditorPanel()
   }
 })
 
@@ -4774,8 +6158,7 @@ canvas.on('selection:cleared', () => {
       renderLayersAccordion()
       return
     }
-    activeRightPanelTab = 'cards'
-    renderWorkspaceTabs()
+    renderEditorPanel()
   }
 })
 
