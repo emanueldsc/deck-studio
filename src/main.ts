@@ -4,17 +4,18 @@ import { TextStyle } from '@tiptap/extension-text-style'
 import Underline from '@tiptap/extension-underline'
 import StarterKit from '@tiptap/starter-kit'
 import {
-    Canvas,
-    Ellipse,
-    Color as FabricColor,
-    FabricImage,
-    FabricText,
-    Line,
-    Polygon,
-    Rect,
-    Textbox,
-    Triangle,
-    type FabricObject,
+  ActiveSelection,
+  Canvas,
+  Ellipse,
+  Color as FabricColor,
+  FabricImage,
+  FabricText,
+  Line,
+  Polygon,
+  Rect,
+  Textbox,
+  Triangle,
+  type FabricObject,
 } from 'fabric'
 import { jsPDF } from 'jspdf'
 import JSZip from 'jszip'
@@ -33,6 +34,7 @@ type ShapeType = 'rect' | 'rounded' | 'ellipse' | 'triangle' | 'diamond' | 'pent
 type LayerScope = 'model' | 'deck' | 'back'
 type EditMode = LayerScope
 type ImageFitMode = 'fill' | 'contain' | 'cover' | 'none' | 'scale-down'
+type AssetScaleMode = 'stretch' | 'nine-slice'
 type TextAlignMode = 'left' | 'center' | 'right' | 'justify'
 type RichTextFormat = 'tags' | 'html'
 
@@ -71,6 +73,12 @@ interface LayerMeta {
   cropPositionY?: number
   richTextSource?: string
   richTextFormat?: RichTextFormat
+  graphicSource?: string
+  scaleMode?: AssetScaleMode
+  insetTop?: number
+  insetRight?: number
+  insetBottom?: number
+  insetLeft?: number
 }
 
 interface CardModelOverride {
@@ -113,6 +121,11 @@ interface LibraryAsset {
   src: string
   width: number
   height: number
+  scaleMode?: AssetScaleMode
+  insetTop?: number
+  insetRight?: number
+  insetBottom?: number
+  insetLeft?: number
 }
 
 interface DeckDocument {
@@ -1443,9 +1456,50 @@ async function refreshDeckThumbnails(deck: DeckDocument): Promise<void> {
   })
 }
 
+const HISTORY_LIMIT = 40
+const history: { key: string; stack: string[]; index: number } = { key: '', stack: [], index: -1 }
+let restoringHistory = false
+
+function historyKey(): string {
+  const deck = currentDeck()
+  return [activeDeckId, activeEditMode, deck.activeCardId, deck.activeModelId, deck.activeBackId].join('|')
+}
+
+function recordHistory(snapshot: unknown): void {
+  if (restoringHistory) return
+  const serialized = JSON.stringify(snapshot)
+  const key = historyKey()
+  if (history.key !== key) {
+    history.key = key
+    history.stack = [serialized]
+    history.index = 0
+    return
+  }
+  if (history.stack[history.index] === serialized) return
+  history.stack = history.stack.slice(0, history.index + 1)
+  history.stack.push(serialized)
+  if (history.stack.length > HISTORY_LIMIT) history.stack.shift()
+  history.index = history.stack.length - 1
+}
+
+async function stepHistory(direction: -1 | 1): Promise<void> {
+  if (history.key !== historyKey() || restoringHistory) return
+  const target = history.index + direction
+  if (target < 0 || target >= history.stack.length) return
+  history.index = target
+  restoringHistory = true
+  try {
+    await loadDeckCanvas(JSON.parse(history.stack[target]) as ReturnType<Canvas['toObject']>)
+  } finally {
+    restoringHistory = false
+  }
+  if (activeEditMode === 'deck') renderCardThumbnails()
+}
+
 function persistActiveDeckDocument(): void {
   const deck = currentDeck()
   const snapshot = canvas.toObject(['data'])
+  recordHistory(snapshot)
   const all = (snapshot.objects ?? []) as Array<{ data?: Partial<LayerMeta> }>
   const modelObjects = all.filter(o => o.data?.scope === 'model') as unknown[]
 
@@ -1726,6 +1780,11 @@ function migrateDeckDocument(raw: Record<string, unknown>): DeckDocument {
         src: a.src as string,
         width: typeof a.width === 'number' && a.width > 0 ? a.width : 0,
         height: typeof a.height === 'number' && a.height > 0 ? a.height : 0,
+        scaleMode: a.scaleMode === 'nine-slice' ? 'nine-slice' : 'stretch',
+        insetTop: Math.max(0, Number(a.insetTop) || 0),
+        insetRight: Math.max(0, Number(a.insetRight) || 0),
+        insetBottom: Math.max(0, Number(a.insetBottom) || 0),
+        insetLeft: Math.max(0, Number(a.insetLeft) || 0),
       })),
     activeModelId: activeCard.modelId,
     activeBackId: activeCard.backId,
@@ -2414,6 +2473,12 @@ const canvas = new Canvas('cardCanvas', {
   preserveObjectStacking: true,
   selection: true,
 })
+const syncEmptyFrame = (): void => {
+  canvasStage.classList.toggle('is-empty', canvas.getObjects().length === 0)
+}
+canvas.on('object:added', syncEmptyFrame)
+canvas.on('object:removed', syncEmptyFrame)
+syncEmptyFrame()
 const thumbnailCanvasElement = document.createElement('canvas')
 thumbnailCanvasElement.width = CARD_WIDTH
 thumbnailCanvasElement.height = CARD_HEIGHT
@@ -2428,6 +2493,13 @@ let baseLayerId = ''
 let layerCount = 0
 let suppressSelectionSync = false
 let draggedLayerId: string | null = null
+let copiedModelAttributes: {
+  sourceIsText: boolean
+  position: Record<string, unknown>
+  shape: Record<string, unknown>
+  font: Record<string, unknown> | null
+  color: Record<string, unknown>
+} | null = null
 let canvasDisplayZoom = 1
 let activeRightPanelTab: 'cards' | 'model-layers' = 'cards'
 let selectedTextEditor: Editor | null = null
@@ -2492,13 +2564,299 @@ function renderEditorPanel(): void {
     return
   }
 
+  if (selected instanceof ActiveSelection) {
+    editItemLabel.textContent = `${selected.getObjects().length} layers selecionados`
+    editPanelContent.innerHTML = ''
+    editPanelContent.append(createArrangeControls())
+    return
+  }
+
   const meta = getLayerMeta(selected)
   editItemLabel.textContent = `${meta.name} • ${layerKindLabel(meta.kind)}`
   editPanelContent.innerHTML = ''
   const body = document.createElement('div')
   body.className = 'layer-body'
-  buildLayerBody(selected, meta, meta.kind !== 'base' && meta.scope === activeEditMode, body)
+  const editable = meta.kind !== 'base' && meta.scope === activeEditMode
+  buildLayerBody(selected, meta, editable, body)
+  if (editable) {
+    body.prepend(createArrangeControls())
+  }
   editPanelContent.append(body)
+}
+
+function createLayerAttributeTransferControls(object: FabricObject): HTMLElement {
+  const controls = document.createElement('div')
+  controls.className = 'layer-attribute-transfer'
+
+  const copyButton = document.createElement('button')
+  copyButton.type = 'button'
+  copyButton.className = 'tiny primary'
+  copyButton.textContent = 'Copiar atributos'
+  copyButton.addEventListener('click', () => {
+    const props = object.toObject(['data']) as Record<string, unknown>
+    const pick = (keys: string[]): Record<string, unknown> => Object.fromEntries(
+      keys.filter((key) => Object.hasOwn(props, key)).map((key) => [key, deepClone(props[key])]),
+    )
+    const geometry = (object: FabricObject): Record<string, unknown> => ({
+      width: object.getScaledWidth(),
+      height: object.getScaledHeight(),
+    })
+    copiedModelAttributes = {
+      sourceIsText: isTextLayer(object),
+      position: {
+        left: object.left,
+        top: object.top,
+        originX: object.originX,
+        originY: object.originY,
+      },
+      shape: {
+        ...geometry(object),
+        ...pick(['angle', 'skewX', 'skewY', 'flipX', 'flipY', 'rx', 'ry', 'strokeWidth', 'strokeDashArray', 'strokeLineCap', 'strokeLineJoin', 'strokeUniform']),
+      },
+      font: isTextLayer(object) ? {
+        ...pick(['fontFamily', 'fontSize', 'fontWeight', 'fontStyle', 'underline', 'linethrough', 'overline', 'textAlign', 'lineHeight', 'charSpacing']),
+        styles: Object.fromEntries(Object.entries(
+          deepClone((object as FabricText | Textbox).styles) as Record<string, Record<string, Record<string, unknown>>>,
+        ).map(([line, characters]) => [line, Object.fromEntries(
+          Object.entries(characters).map(([character, style]) => [character, Object.fromEntries(
+            Object.entries(style).filter(([key]) => [
+              'fontFamily', 'fontSize', 'fontWeight', 'fontStyle', 'underline', 'linethrough', 'overline', 'deltaY',
+            ].includes(key)),
+          )]).filter(([, style]) => Object.keys(style as Record<string, unknown>).length > 0),
+        )]).filter(([, characters]) => Object.keys(characters as Record<string, unknown>).length > 0)),
+      } : null,
+      color: pick(['fill', 'stroke']),
+    }
+    pasteButtons.forEach((button) => { button.disabled = false })
+    pasteFontButton.disabled = !isTextLayer(object)
+  })
+
+  const applyPasteGroup = (group: 'position' | 'shape' | 'font' | 'color'): void => {
+    const copiedAttributes = copiedModelAttributes
+    if (!copiedAttributes) return
+    const values = copiedAttributes[group]
+    if (!values || (group === 'font' && (!copiedAttributes.sourceIsText || !isTextLayer(object)))) return
+    const properties = deepClone(values)
+    if (group === 'shape') {
+      const size = properties as { width: number; height: number }
+      const shapeProperties = { ...properties }
+      delete shapeProperties.width
+      delete shapeProperties.height
+      if (!(object instanceof Rect)) {
+        delete shapeProperties.rx
+        delete shapeProperties.ry
+      }
+      object.set({
+        ...shapeProperties,
+        scaleX: size.width / Math.max(1, object.width ?? 1),
+        scaleY: size.height / Math.max(1, object.height ?? 1),
+      })
+    } else if (group === 'font' && isTextLayer(object)) {
+      const font = properties as Record<string, unknown>
+      const { styles, ...fontProperties } = font
+      object.set(fontProperties)
+      const currentStyles = deepClone((object as FabricText | Textbox).styles) as Record<string, Record<string, Record<string, unknown>>>
+      Object.entries(styles as Record<string, Record<string, Record<string, unknown>>>).forEach(([line, characters]) => {
+        currentStyles[line] ??= {}
+        Object.entries(characters).forEach(([character, style]) => {
+          currentStyles[line][character] = { ...(currentStyles[line][character] ?? {}), ...style }
+        })
+      })
+      ;(object as FabricText | Textbox).set('styles', currentStyles)
+    } else {
+      object.set(properties)
+    }
+  }
+
+  const finishPaste = (): void => {
+    object.set('dirty', true)
+    object.setCoords()
+    canvas.requestRenderAll()
+    persistActiveDeckDocument()
+    renderLayersAccordion()
+  }
+
+  const paste = (group: 'position' | 'shape' | 'font' | 'color'): void => {
+    applyPasteGroup(group)
+    finishPaste()
+  }
+
+  const makePasteButton = (label: string, group: 'position' | 'shape' | 'font' | 'color'): HTMLButtonElement => {
+    const button = document.createElement('button')
+    button.type = 'button'
+    button.className = 'tiny ghost'
+    button.textContent = label
+    button.disabled = !copiedModelAttributes || (group === 'font' && (!copiedModelAttributes.sourceIsText || !isTextLayer(object)))
+    button.addEventListener('click', () => paste(group))
+    return button
+  }
+
+  const pastePositionButton = makePasteButton('Colar somente posição', 'position')
+  const pasteShapeButton = makePasteButton('Colar somente forma', 'shape')
+  const pasteFontButton = makePasteButton('Colar somente fonte', 'font')
+  const pasteColorButton = makePasteButton('Colar somente cor', 'color')
+  const pasteAllButton = document.createElement('button')
+  pasteAllButton.type = 'button'
+  pasteAllButton.className = 'tiny primary'
+  pasteAllButton.textContent = 'Colar tudo'
+  pasteAllButton.disabled = !copiedModelAttributes
+  pasteAllButton.addEventListener('click', () => {
+    if (!copiedModelAttributes) return
+    applyPasteGroup('position')
+    applyPasteGroup('shape')
+    applyPasteGroup('font')
+    applyPasteGroup('color')
+    finishPaste()
+  })
+  const pasteButtons = [pastePositionButton, pasteShapeButton, pasteFontButton, pasteColorButton, pasteAllButton]
+
+  const actions = document.createElement('div')
+  actions.className = 'layer-attribute-actions'
+  actions.append(copyButton, ...pasteButtons)
+  controls.append(actions)
+  return controls
+}
+
+function createArrangeControls(): HTMLElement {
+  const wrap = document.createElement('div')
+  wrap.className = 'arrange-controls'
+
+  const targets = (): FabricObject[] => canvas.getActiveObjects().filter((object) => {
+    const meta = getLayerMeta(object)
+    return meta.kind !== 'base' && meta.scope === activeEditMode
+  })
+
+  // Opera em coordenadas absolutas: desfaz a seleção múltipla, aplica e restaura.
+  const apply = (change: (objects: FabricObject[]) => void): void => {
+    const objects = targets()
+    if (objects.length === 0) return
+    const wasMulti = canvas.getActiveObject() instanceof ActiveSelection
+    canvas.discardActiveObject()
+    change(objects)
+    objects.forEach((object) => object.setCoords())
+    if (wasMulti && objects.length > 1) {
+      canvas.setActiveObject(new ActiveSelection(objects, { canvas }))
+    } else {
+      canvas.setActiveObject(objects[0])
+    }
+    canvas.requestRenderAll()
+    persistActiveDeckDocument()
+    renderLayersAccordion()
+  }
+
+  const shift = (object: FabricObject, dx: number, dy: number): void => {
+    object.set({ left: (object.left ?? 0) + dx, top: (object.top ?? 0) + dy })
+  }
+
+  const bounds = (objects: FabricObject[]): { left: number; top: number; right: number; bottom: number } => {
+    if (objects.length === 1) return { left: 0, top: 0, right: CARD_WIDTH, bottom: CARD_HEIGHT }
+    const rects = objects.map((object) => object.getBoundingRect())
+    return {
+      left: Math.min(...rects.map((r) => r.left)),
+      top: Math.min(...rects.map((r) => r.top)),
+      right: Math.max(...rects.map((r) => r.left + r.width)),
+      bottom: Math.max(...rects.map((r) => r.top + r.height)),
+    }
+  }
+
+  type AlignMode = 'left' | 'centerX' | 'right' | 'top' | 'centerY' | 'bottom'
+  const align = (mode: AlignMode): void => apply((objects) => {
+    const box = bounds(objects)
+    objects.forEach((object) => {
+      const r = object.getBoundingRect()
+      if (mode === 'left') shift(object, box.left - r.left, 0)
+      else if (mode === 'right') shift(object, box.right - (r.left + r.width), 0)
+      else if (mode === 'centerX') shift(object, (box.left + box.right) / 2 - (r.left + r.width / 2), 0)
+      else if (mode === 'top') shift(object, 0, box.top - r.top)
+      else if (mode === 'bottom') shift(object, 0, box.bottom - (r.top + r.height))
+      else shift(object, 0, (box.top + box.bottom) / 2 - (r.top + r.height / 2))
+    })
+  })
+
+  const distribute = (axis: 'x' | 'y'): void => apply((objects) => {
+    if (objects.length < 3) return
+    const items = objects
+      .map((object) => ({ object, r: object.getBoundingRect() }))
+      .sort((a, b) => (axis === 'x' ? a.r.left - b.r.left : a.r.top - b.r.top))
+    const size = (r: { width: number; height: number }): number => (axis === 'x' ? r.width : r.height)
+    const start = axis === 'x' ? items[0].r.left : items[0].r.top
+    const last = items[items.length - 1].r
+    const end = axis === 'x' ? last.left + last.width : last.top + last.height
+    const gap = (end - start - items.reduce((sum, item) => sum + size(item.r), 0)) / (items.length - 1)
+    let cursor = start
+    items.forEach(({ object, r }) => {
+      const current = axis === 'x' ? r.left : r.top
+      if (axis === 'x') shift(object, cursor - current, 0)
+      else shift(object, 0, cursor - current)
+      cursor += size(r) + gap
+    })
+  })
+
+  const fill = (horizontal: boolean, vertical: boolean): void => apply((objects) => {
+    objects.forEach((object) => {
+      const r = object.getBoundingRect()
+      if (horizontal && r.width >= 1) {
+        object.set({ scaleX: (object.scaleX ?? 1) * (CARD_WIDTH / r.width) })
+      }
+      if (vertical && r.height >= 1) {
+        object.set({ scaleY: (object.scaleY ?? 1) * (CARD_HEIGHT / r.height) })
+      }
+      object.setCoords()
+      const next = object.getBoundingRect()
+      shift(
+        object,
+        horizontal ? CARD_WIDTH / 2 - (next.left + next.width / 2) : 0,
+        vertical ? CARD_HEIGHT / 2 - (next.top + next.height / 2) : 0,
+      )
+    })
+  })
+
+  const group = (title: string, items: Array<[string, string, () => void]>): void => {
+    const row = document.createElement('div')
+    row.className = 'arrange-row'
+    const label = document.createElement('span')
+    label.className = 'arrange-label'
+    label.textContent = title
+    row.append(label)
+    items.forEach(([text, tip, handler]) => {
+      const button = document.createElement('button')
+      button.type = 'button'
+      button.className = 'tiny ghost'
+      button.textContent = text
+      button.title = tip
+      button.setAttribute('aria-label', tip)
+      button.addEventListener('click', handler)
+      row.append(button)
+    })
+    wrap.append(row)
+  }
+
+  group('Preencher', [
+    ['↔ Largura', 'Preencher toda a largura da carta', () => fill(true, false)],
+    ['↕ Altura', 'Preencher toda a altura da carta', () => fill(false, true)],
+    ['⤢ Tudo', 'Preencher largura e altura da carta', () => fill(true, true)],
+  ])
+  group('Alinhar', [
+    ['⇤', 'Alinhar à esquerda', () => align('left')],
+    ['⇹', 'Centralizar na horizontal', () => align('centerX')],
+    ['⇥', 'Alinhar à direita', () => align('right')],
+    ['⤒', 'Alinhar ao topo', () => align('top')],
+    ['⇕', 'Centralizar na vertical', () => align('centerY')],
+    ['⤓', 'Alinhar à base', () => align('bottom')],
+  ])
+  if (canvas.getActiveObject() instanceof ActiveSelection) {
+    group('Distribuir', [
+      ['↔', 'Distribuir horizontalmente (3+ itens)', () => distribute('x')],
+      ['↕', 'Distribuir verticalmente (3+ itens)', () => distribute('y')],
+    ])
+  }
+  const hint = document.createElement('p')
+  hint.className = 'layer-note'
+  hint.textContent = canvas.getActiveObject() instanceof ActiveSelection
+    ? 'Alinha entre os itens selecionados.'
+    : 'Alinha em relação à carta. Selecione vários itens (arraste na carta) para alinhar entre si.'
+  wrap.append(hint)
+  return wrap
 }
 
 function syncModeControls(): void {
@@ -2709,6 +3067,100 @@ function createGraphicSizeControls(graphic: FabricObject): DocumentFragment {
   return fragment
 }
 
+function createGraphicScaleControls(graphic: FabricObject): DocumentFragment {
+  const fragment = document.createDocumentFragment()
+  if (!(graphic instanceof FabricImage)) return fragment
+
+  const meta = getLayerMeta(graphic)
+  const libraryAsset = currentDeck().library.find((asset) => asset.name === meta.name)
+  const graphicSource = meta.graphicSource ?? libraryAsset?.src ?? graphic.getSrc()
+  const insets: Array<{ label: string; key: 'insetTop' | 'insetRight' | 'insetBottom' | 'insetLeft' }> = [
+    { label: 'Topo', key: 'insetTop' },
+    { label: 'Direita', key: 'insetRight' },
+    { label: 'Base', key: 'insetBottom' },
+    { label: 'Esquerda', key: 'insetLeft' },
+  ]
+
+  const insetFields = document.createElement('div')
+  insetFields.className = 'graphic-insets'
+  insetFields.hidden = meta.scaleMode !== 'nine-slice'
+
+  const applyMode = async (): Promise<void> => {
+    const targetWidth = Math.max(1, Math.round((graphic.width ?? 1) * (graphic.scaleX ?? 1)))
+    const targetHeight = Math.max(1, Math.round((graphic.height ?? 1) * (graphic.scaleY ?? 1)))
+    const mode = modeField.value === 'nine-slice' ? 'nine-slice' : 'stretch'
+    const nextMeta: LayerMeta = {
+      ...meta,
+      graphicSource,
+      scaleMode: mode,
+    }
+    const sourceImage = await FabricImage.fromURL(graphicSource)
+    const nextSrc = mode === 'nine-slice'
+      ? await createNineSliceDataUrl(sourceImage, {
+        id: nextMeta.id,
+        name: nextMeta.name,
+        src: graphicSource,
+        width: targetWidth,
+        height: targetHeight,
+        scaleMode: mode,
+        insetTop: nextMeta.insetTop,
+        insetRight: nextMeta.insetRight,
+        insetBottom: nextMeta.insetBottom,
+        insetLeft: nextMeta.insetLeft,
+      })
+      : graphicSource
+
+    await graphic.setSrc(nextSrc)
+    graphic.set({
+      scaleX: targetWidth / Math.max(1, graphic.width ?? targetWidth),
+      scaleY: targetHeight / Math.max(1, graphic.height ?? targetHeight),
+    })
+    setLayerMeta(graphic, nextMeta)
+    graphic.setCoords()
+    canvas.requestRenderAll()
+    persistActiveDeckDocument()
+  }
+
+  const modeField = document.createElement('select')
+  modeField.innerHTML = '<option value="stretch">Normal</option><option value="nine-slice">9 partes</option>'
+  modeField.value = meta.scaleMode ?? 'stretch'
+  attachNoDragPropagation(modeField)
+  modeField.addEventListener('change', () => {
+    insetFields.hidden = modeField.value !== 'nine-slice'
+    void withLoading(applyMode)
+  })
+  fragment.append(detailsRow('Modo de escala', modeField))
+
+  insets.forEach(({ label, key }) => {
+    const wrapper = document.createElement('label')
+    wrapper.textContent = label
+    const input = document.createElement('input')
+    input.type = 'number'
+    input.min = '0'
+    input.max = '4000'
+    input.step = '1'
+    input.value = String(meta[key] ?? 0)
+    attachNoDragPropagation(input)
+    input.addEventListener('change', () => {
+      meta[key] = Math.max(0, Math.round(Number(input.value) || 0))
+      input.value = String(meta[key])
+      if (modeField.value === 'nine-slice') void withLoading(applyMode)
+      else {
+        setLayerMeta(graphic, { ...meta, graphicSource, scaleMode: 'stretch' })
+        persistActiveDeckDocument()
+      }
+    })
+    wrapper.append(input)
+    insetFields.append(wrapper)
+  })
+  fragment.append(insetFields)
+
+  if (!meta.graphicSource) {
+    setLayerMeta(graphic, { ...meta, graphicSource })
+  }
+  return fragment
+}
+
 function renderSelectedGraphicEditor(graphic: FabricObject): void {
   const commit = (): void => {
     graphic.setCoords()
@@ -2734,6 +3186,7 @@ function renderSelectedGraphicEditor(graphic: FabricObject): void {
 
   editPanelContent.append(
     createGraphicSizeControls(graphic),
+    createGraphicScaleControls(graphic),
     detailsRow('Opacidade', range(0, 1, 0.01, graphic.opacity ?? 1, (v) => { graphic.set({ opacity: v }); commit() })),
     detailsRow('Escala', range(0.05, 4, 0.01, graphic.scaleX ?? 1, (v) => { graphic.set({ scaleX: v, scaleY: v }); commit() })),
     detailsRow('Rotação', range(-180, 180, 1, graphic.angle ?? 0, (v) => { graphic.set({ angle: v }); commit() })),
@@ -3052,6 +3505,12 @@ function getLayerMeta(object: FabricObject): LayerMeta {
     cropPositionY: typeof raw?.cropPositionY === 'number' ? clamp(0, 1, raw.cropPositionY) : 0.5,
     richTextSource: typeof raw?.richTextSource === 'string' ? raw.richTextSource : undefined,
     richTextFormat: raw?.richTextFormat === 'html' ? 'html' : 'tags',
+    graphicSource: typeof raw?.graphicSource === 'string' ? raw.graphicSource : undefined,
+    scaleMode: raw?.scaleMode === 'nine-slice' ? 'nine-slice' : 'stretch',
+    insetTop: Math.max(0, Number(raw?.insetTop) || 0),
+    insetRight: Math.max(0, Number(raw?.insetRight) || 0),
+    insetBottom: Math.max(0, Number(raw?.insetBottom) || 0),
+    insetLeft: Math.max(0, Number(raw?.insetLeft) || 0),
   }
   setLayerMeta(object, meta)
   return meta
@@ -3211,7 +3670,7 @@ function refreshLayerIndex(): void {
 
 function selectedLayerId(): string | null {
   const active = canvas.getActiveObject()
-  if (!active) {
+  if (!active || active instanceof ActiveSelection) {
     return null
   }
   return getLayerMeta(active).id
@@ -3324,7 +3783,24 @@ function detailsRow(labelText: string, control: HTMLElement): HTMLDivElement {
 
   const label = document.createElement('label')
   label.textContent = labelText
-  label.append(control)
+  if (control instanceof HTMLInputElement && control.type === 'range') {
+    const slider = document.createElement('span')
+    slider.className = 'layer-range-control'
+    const value = document.createElement('output')
+    value.className = 'layer-range-value'
+    const updateValue = (): void => {
+      const numericValue = Number(control.value)
+      const precision = Math.max(0, (control.step.split('.')[1] ?? '').length)
+      value.value = numericValue.toFixed(precision)
+      value.textContent = value.value
+    }
+    updateValue()
+    control.addEventListener('input', updateValue)
+    slider.append(control, value)
+    label.append(slider)
+  } else {
+    label.append(control)
+  }
   row.append(label)
 
   return row
@@ -3847,6 +4323,10 @@ function buildLayerBody(object: FabricObject, meta: LayerMeta, editable: boolean
       return
     }
 
+    if (activeEditMode === 'model') {
+      body.append(createLayerAttributeTransferControls(object))
+    }
+
     const xInput = document.createElement('input')
     xInput.type = 'number'
     xInput.step = '1'
@@ -3919,6 +4399,7 @@ function buildLayerBody(object: FabricObject, meta: LayerMeta, editable: boolean
 
     if (meta.kind === 'graphic') {
       body.append(createGraphicSizeControls(object))
+      body.append(createGraphicScaleControls(object))
     }
 
     if (isTextLayer(object)) {
@@ -4612,6 +5093,14 @@ function renderLibrary(): void {
 
     item.append(insertBtn, removeBtn)
 
+    const settings = document.createElement('details')
+    settings.className = 'library-asset-settings'
+    const settingsSummary = document.createElement('summary')
+    settingsSummary.textContent = 'Ajustes'
+    settings.append(settingsSummary)
+
+    const settingsContent = document.createElement('div')
+    settingsContent.className = 'library-asset-settings-content'
     const sizeRow = document.createElement('div')
     sizeRow.className = 'library-size'
     const sizeInput = (label: string, value: number, onChange: (v: number) => void): HTMLLabelElement => {
@@ -4630,14 +5119,62 @@ function renderLibrary(): void {
       sizeInput('L', asset.width, (v) => { asset.width = v }),
       sizeInput('A', asset.height, (v) => { asset.height = v }),
     )
-    item.append(sizeRow)
+    settingsContent.append(sizeRow)
+
+    const scaleModeLabel = document.createElement('label')
+    scaleModeLabel.className = 'library-scale-mode'
+    scaleModeLabel.textContent = 'Escala'
+    const scaleMode = document.createElement('select')
+    scaleMode.innerHTML = '<option value="stretch">Normal</option><option value="nine-slice">9 partes</option>'
+    scaleMode.value = asset.scaleMode ?? 'stretch'
+    scaleMode.title = 'Em 9 partes, os cantos ficam preservados e o centro é esticado.'
+    scaleMode.addEventListener('change', () => {
+      asset.scaleMode = scaleMode.value === 'nine-slice' ? 'nine-slice' : 'stretch'
+      insets.hidden = asset.scaleMode !== 'nine-slice'
+    })
+    scaleModeLabel.append(scaleMode)
+    settingsContent.append(scaleModeLabel)
+
+    const insets = document.createElement('div')
+    insets.className = 'library-insets'
+    insets.hidden = asset.scaleMode !== 'nine-slice'
+    const insetInput = (label: string, key: 'insetTop' | 'insetRight' | 'insetBottom' | 'insetLeft'): HTMLLabelElement => {
+      const wrapper = document.createElement('label')
+      wrapper.textContent = label
+      const input = document.createElement('input')
+      input.type = 'number'
+      input.min = '0'
+      input.max = '4000'
+      input.step = '1'
+      input.value = String(asset[key] ?? 0)
+      input.title = `Margem ${label.toLowerCase()} em pixels da imagem original`
+      input.addEventListener('change', () => {
+        asset[key] = Math.max(0, Math.round(Number(input.value) || 0))
+        input.value = String(asset[key])
+      })
+      wrapper.append(input)
+      return wrapper
+    }
+    insets.append(
+      insetInput('Topo', 'insetTop'),
+      insetInput('Dir.', 'insetRight'),
+      insetInput('Base', 'insetBottom'),
+      insetInput('Esq.', 'insetLeft'),
+    )
+    settingsContent.append(insets)
+    settings.append(settingsContent)
+    item.append(settings)
     libraryGrid.append(item)
   })
 }
 
 async function addLibraryGraphic(asset: LibraryAsset): Promise<void> {
   await withLoading(async () => {
-    const image = await FabricImage.fromURL(asset.src)
+    const sourceImage = await FabricImage.fromURL(asset.src)
+    const imageSource = asset.scaleMode === 'nine-slice'
+      ? await createNineSliceDataUrl(sourceImage, asset)
+      : asset.src
+    const image = imageSource === asset.src ? sourceImage : await FabricImage.fromURL(imageSource)
     const naturalSize = defaultAssetSize(image.width ?? 1, image.height ?? 1)
     const targetWidth = asset.width > 0 ? asset.width : naturalSize.width
     const targetHeight = asset.height > 0 ? asset.height : naturalSize.height
@@ -4649,7 +5186,18 @@ async function addLibraryGraphic(asset: LibraryAsset): Promise<void> {
       scaleX: targetWidth / Math.max(1, image.width ?? 1),
       scaleY: targetHeight / Math.max(1, image.height ?? 1),
     })
-    setLayerMeta(image, { id: generateLayerId(), kind: 'graphic', name: asset.name, scope: activeEditMode })
+    setLayerMeta(image, {
+      id: generateLayerId(),
+      kind: 'graphic',
+      name: asset.name,
+      scope: activeEditMode,
+      graphicSource: asset.src,
+      scaleMode: asset.scaleMode ?? 'stretch',
+      insetTop: asset.insetTop ?? 0,
+      insetRight: asset.insetRight ?? 0,
+      insetBottom: asset.insetBottom ?? 0,
+      insetLeft: asset.insetLeft ?? 0,
+    })
     applyRuntimeConfig(image)
     canvas.add(image)
     canvas.setActiveObject(image)
@@ -4659,6 +5207,51 @@ async function addLibraryGraphic(asset: LibraryAsset): Promise<void> {
     canvas.requestRenderAll()
   })
   if (activeEditMode === 'deck') renderWorkspaceTabs()
+}
+
+async function createNineSliceDataUrl(image: FabricImage, asset: LibraryAsset): Promise<string> {
+  const source = image.getElement() as HTMLImageElement
+  const sourceWidth = image.width ?? source.naturalWidth
+  const sourceHeight = image.height ?? source.naturalHeight
+  const outputWidth = Math.max(1, Math.round(asset.width || sourceWidth))
+  const outputHeight = Math.max(1, Math.round(asset.height || sourceHeight))
+  const insetLeft = clamp(0, sourceWidth, asset.insetLeft ?? 0)
+  const insetRight = clamp(0, sourceWidth - insetLeft, asset.insetRight ?? 0)
+  const insetTop = clamp(0, sourceHeight, asset.insetTop ?? 0)
+  const insetBottom = clamp(0, sourceHeight - insetTop, asset.insetBottom ?? 0)
+  const fitInsets = (first: number, second: number, target: number): [number, number] => {
+    const total = first + second
+    return total > target && total > 0
+      ? [target * first / total, target * second / total]
+      : [first, second]
+  }
+  const [targetLeft, targetRight] = fitInsets(insetLeft, insetRight, outputWidth)
+  const [targetTop, targetBottom] = fitInsets(insetTop, insetBottom, outputHeight)
+  const sourceX = [0, insetLeft, sourceWidth - insetRight, sourceWidth]
+  const sourceY = [0, insetTop, sourceHeight - insetBottom, sourceHeight]
+  const targetX = [0, targetLeft, outputWidth - targetRight, outputWidth]
+  const targetY = [0, targetTop, outputHeight - targetBottom, outputHeight]
+  const output = document.createElement('canvas')
+  output.width = outputWidth
+  output.height = outputHeight
+  const context = output.getContext('2d')
+  if (!context) throw new Error('Não foi possível gerar o gráfico em nove partes.')
+
+  for (let row = 0; row < 3; row += 1) {
+    for (let column = 0; column < 3; column += 1) {
+      const width = sourceX[column + 1] - sourceX[column]
+      const height = sourceY[row + 1] - sourceY[row]
+      const destinationWidth = targetX[column + 1] - targetX[column]
+      const destinationHeight = targetY[row + 1] - targetY[row]
+      if (width <= 0 || height <= 0 || destinationWidth <= 0 || destinationHeight <= 0) continue
+      context.drawImage(
+        source,
+        sourceX[column], sourceY[row], width, height,
+        targetX[column], targetY[row], destinationWidth, destinationHeight,
+      )
+    }
+  }
+  return output.toDataURL('image/png')
 }
 
 async function addFilesToLibrary(files: FileList): Promise<void> {
@@ -4841,17 +5434,56 @@ async function applyCardTemplate(preset: CardTemplatePreset): Promise<void> {
   })
 }
 
-function renderTemplateGallery(): void {
+function renderTemplateGallery(isNewModel = false): void {
   templatesGrid.innerHTML = ''
+  const blank = document.createElement('article')
+  blank.className = 'template-card'
+  blank.style.cursor = 'pointer'
+  blank.style.setProperty('--template-ink', '#64748b')
+  blank.style.setProperty('--template-accent', '#94a3b8')
+  blank.style.setProperty('--template-paper', '#ffffff')
+  blank.style.setProperty('--template-deep', '#334155')
+  blank.innerHTML = '<div class="template-card-preview" style="display:grid;place-items:center"><span class="material-symbols-outlined" style="font-size:56px;opacity:.5">crop_portrait</span></div><div class="template-card-content"><span class="template-family">Do zero</span><h3>Modelo limpo</h3><p>Começar com a carta vazia, sem nenhum elemento.</p><button class="primary template-apply" type="button">Usar modelo limpo</button></div>'
+  blank.addEventListener('click', async () => {
+    if (isNewModel) {
+      templatesModal.hidden = true
+      return
+    }
+    const deck = currentDeck()
+    const hasModel = activeEditMode === 'model'
+      ? canvas.getObjects().length > 0
+      : ((modelOfCard(deck, deck.cards.find(c => c.id === deck.activeCardId)).canvas.objects ?? []) as unknown[]).length > 0
+    if (hasModel && !window.confirm('Usar o modelo limpo apagará o layout atual da frente. Continuar?')) return
+    templatesModal.hidden = true
+    persistActiveDeckDocument()
+    if (activeEditMode !== 'model') {
+      deck.activeModelId = modelOfCard(deck, deck.cards.find(c => c.id === deck.activeCardId)).id
+    }
+    activeEditMode = 'model'
+    activeRightPanelTab = 'model-layers'
+    destroySelectedTextEditor()
+    const targetModel = activeModelOf(deck)
+    targetModel.canvas = createEmptyCanvasState()
+    deck.cards.forEach((card) => {
+      if (card.modelId !== targetModel.id) return
+      card.modelOverrides = {}
+      card.thumbnail = ''
+    })
+    await loadActiveModelIntoEditor()
+    renderWorkspaceTabs()
+    await refreshDeckThumbnails(deck)
+  })
+  templatesGrid.append(blank)
   CARD_TEMPLATE_PRESETS.forEach((preset) => {
     const card = document.createElement('article')
     card.className = 'template-card'
+    card.style.cursor = 'pointer'
     card.style.setProperty('--template-ink', preset.colors[0])
     card.style.setProperty('--template-accent', preset.colors[1])
     card.style.setProperty('--template-paper', preset.colors[2])
     card.style.setProperty('--template-deep', preset.colors[3])
     card.innerHTML = `<div class="template-card-preview layout-${preset.layout}"><div class="template-preview-title">${preset.title}</div><div class="template-preview-art"><span class="material-symbols-outlined">image</span></div><div class="template-preview-type">${preset.typeLine}</div><div class="template-preview-copy">Texto de regras e habilidades da carta.</div><div class="template-preview-stat">${preset.stats}</div></div><div class="template-card-content"><span class="template-family">${preset.family}</span><h3>${preset.name}</h3><p>${preset.description}</p><button class="primary template-apply" type="button">Usar este modelo</button></div>`
-    card.querySelector<HTMLButtonElement>('.template-apply')?.addEventListener('click', async () => {
+    card.addEventListener('click', async () => {
       const deck = currentDeck()
       const hasModel = activeEditMode === 'model'
         ? canvas.getObjects().length > 0
@@ -5073,7 +5705,7 @@ async function addVariant(): Promise<void> {
   const model: CardModel = { id: generateDeckId(), name: `Modelo ${deck.models.length + 1}`, canvas: createEmptyCanvasState() }
   deck.models.push(model)
   await switchVariant(model.id)
-  renderTemplateGallery()
+  renderTemplateGallery(true)
   templatesModal.hidden = false
 }
 
@@ -6150,6 +6782,15 @@ canvasPanel.addEventListener('wheel', (event) => {
 window.addEventListener('keydown', (event) => {
   if (isEditingField(event.target)) {
     return
+  }
+
+  if ((event.ctrlKey || event.metaKey) && !event.altKey) {
+    const key = event.key.toLowerCase()
+    if (key === 'z' || key === 'y') {
+      event.preventDefault()
+      void stepHistory(key === 'y' || event.shiftKey ? 1 : -1)
+      return
+    }
   }
 
   if (event.key === 'Delete') {

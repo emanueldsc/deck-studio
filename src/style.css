@@ -759,6 +759,17 @@ button.tiny {
   gap: 8px;
 }
 
+.layer-attribute-transfer { display: grid; gap: 6px; }
+.layer-attribute-transfer > strong { font-size: 0.84rem; }
+
+.layer-attribute-actions {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 6px;
+}
+
+.layer-attribute-actions button { min-width: 0; white-space: normal; }
+
 .layer-note {
   margin: 0;
   color: #64748b;
@@ -788,6 +799,26 @@ button.tiny {
 .layer-detail-row textarea,
 .layer-detail-row select {
   width: 100%;
+}
+
+.layer-range-control {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 4.5em;
+  align-items: center;
+  gap: 8px;
+}
+
+.layer-detail-row .layer-range-control input[type='range'] {
+  min-width: 0;
+}
+
+.layer-range-value {
+  padding: 3px 6px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+  text-align: right;
 }
 
 .text-color-palette {
@@ -1664,6 +1695,21 @@ input[type='color'] {
 
 .library-size input { min-width: 0; width: 100%; padding: 3px 4px; font-size: 0.75rem; }
 
+.library-scale-mode { display: grid; gap: 2px; font-size: 0.68rem; font-weight: 700; color: var(--muted); }
+.library-scale-mode select { min-width: 0; width: 100%; padding: 4px; font-size: 0.74rem; }
+.library-insets { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 3px; }
+.library-insets[hidden] { display: none; }
+.library-insets label { display: grid; gap: 2px; min-width: 0; font-size: 0.64rem; font-weight: 700; color: var(--muted); }
+.library-insets input { min-width: 0; width: 100%; padding: 3px; font-size: 0.7rem; }
+.library-asset-settings { min-width: 0; font-size: 0.72rem; }
+.library-asset-settings summary { padding: 4px 2px; color: var(--muted); cursor: pointer; font-weight: 700; }
+.library-asset-settings[open] summary { color: var(--ink); }
+.library-asset-settings-content { display: grid; gap: 6px; padding: 2px 1px 4px; }
+.graphic-insets { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 6px; }
+.graphic-insets[hidden] { display: none; }
+.graphic-insets label { display: grid; gap: 3px; font-size: 0.75rem; font-weight: 700; }
+.graphic-insets input { min-width: 0; width: 100%; }
+
 .confirm-choice {
   display: grid;
   gap: 4px;
@@ -1818,9 +1864,9 @@ input[type='color'] {
 .cover-field-row { display: flex; align-items: center; gap: 6px; }
 .cover-preview { width: 88px; aspect-ratio: 16 / 9; border-radius: 6px; border: 1px solid #c9d8ec; background: #e2e8f0 center / cover no-repeat; flex-shrink: 0; }
 .preset-deck-cover { aspect-ratio: 16 / 9; border-radius: 8px; background: #dbe4f0 center / cover no-repeat; }
-.canvas-cover-bg { position: absolute; inset: 0; z-index: 0; border-radius: 14px; overflow: hidden; background: center / cover no-repeat; display: none; }
+.canvas-cover-bg { position: absolute; inset: 0; z-index: 0; border-radius: 14px; overflow: hidden; background: center / cover no-repeat; display: none; transform: scale(1.2); }
 .canvas-panel.has-cover .canvas-cover-bg { display: block; }
-.canvas-cover-bg.is-blur { filter: blur(3px); transform: scale(1.08); }
+.canvas-cover-bg.is-blur { filter: blur(4px); }
 .canvas-panel.has-cover { overflow: hidden; border-radius: 14px; }
 .canvas-panel.has-cover .canvas-stage { background: transparent; border-color: transparent; }
 .canvas-stage { position: relative; z-index: 1; }
@@ -1828,3 +1874,12 @@ input[type='color'] {
 .cover-switch button { border: 0; background: transparent; color: inherit; padding: 5px 10px; font-size: 0.75rem; font-weight: 600; cursor: pointer; }
 .cover-switch button.is-active { background: #0f4ccf; color: #fff; }
 .cover-switch button:disabled { opacity: 0.45; cursor: not-allowed; }
+
+.arrange-controls { display: grid; gap: 6px; margin-bottom: 10px; }
+.arrange-row { display: flex; flex-wrap: wrap; align-items: center; gap: 4px; }
+.arrange-label { min-width: 68px; font-size: 0.75rem; opacity: 0.8; }
+
+.canvas-stage.is-empty canvas {
+  background: rgba(0, 0, 0, 0.3);
+  box-shadow: 1px 0 4px 0 rgba(0, 0, 0, 0.5), 0 4px 4px rgba(0, 0, 0, 0.5)
+}
