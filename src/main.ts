@@ -4,21 +4,34 @@ import { TextStyle } from '@tiptap/extension-text-style'
 import Underline from '@tiptap/extension-underline'
 import StarterKit from '@tiptap/starter-kit'
 import {
-  ActiveSelection,
-  Canvas,
-  Ellipse,
-  Color as FabricColor,
-  FabricImage,
-  FabricText,
-  Line,
-  Polygon,
-  Rect,
-  Textbox,
-  Triangle,
-  type FabricObject,
+    ActiveSelection,
+    Canvas,
+    Control,
+    controlsUtils,
+    Ellipse,
+    Color as FabricColor,
+    FabricImage,
+    FabricText,
+    Line,
+    Polygon,
+    Rect,
+    Textbox,
+    Triangle,
+    type FabricObject,
 } from 'fabric'
 import { jsPDF } from 'jspdf'
 import JSZip from 'jszip'
+import {
+    activeDeckFileHandle,
+    activeDeckPermissionGranted,
+    clearActiveDeckFileHandle,
+    createDeckArchive,
+    readDeckArchive,
+    saveLightweightAutosave,
+    selecionarLocalArquivo,
+    stripImagePayloads,
+    writeActiveDeckFile,
+} from './deck-persistence'
 import { withLoading } from './loading'
 import './style.css'
 
@@ -36,6 +49,8 @@ type EditMode = LayerScope
 type ImageFitMode = 'fill' | 'contain' | 'cover' | 'none' | 'scale-down'
 type AssetScaleMode = 'stretch' | 'nine-slice'
 type TextAlignMode = 'left' | 'center' | 'right' | 'justify'
+type TextVerticalAlignMode = 'top' | 'middle' | 'bottom'
+type TextOverflowMode = 'expand' | 'clip'
 type RichTextFormat = 'tags' | 'html'
 
 interface ShadowOverride {
@@ -46,6 +61,7 @@ interface ShadowOverride {
 }
 
 interface CardTextPropsOverride {
+  width?: number
   fontFamily?: string
   fontSize?: number
   fontWeight?: string | number
@@ -57,6 +73,9 @@ interface CardTextPropsOverride {
   stroke?: string
   strokeWidth?: number
   textAlign?: TextAlignMode
+  textVerticalAlign?: TextVerticalAlignMode
+  textOverflow?: TextOverflowMode
+  textBoxHeight?: number
   lineHeight?: number
   shadow?: ShadowOverride | null
 }
@@ -73,8 +92,13 @@ interface LayerMeta {
   cropPositionY?: number
   richTextSource?: string
   richTextFormat?: RichTextFormat
+  textVerticalAlign?: TextVerticalAlignMode
+  textOverflow?: TextOverflowMode
+  textBoxHeight?: number
   graphicSource?: string
   scaleMode?: AssetScaleMode
+  locked?: boolean
+  isBackground?: boolean
   insetTop?: number
   insetRight?: number
   insetBottom?: number
@@ -90,12 +114,14 @@ interface CardModelOverride {
   fit?: ImageFitMode
   cropPositionX?: number
   cropPositionY?: number
+  hidden?: boolean
 }
 
 interface CardState {
   id: string
   name: string
-  deckObjects: unknown[]
+  canvas?: ReturnType<Canvas['toObject']>
+  deckObjects?: unknown[]
   modelId: string
   backId: string
   modelOverrides: Record<string, CardModelOverride>
@@ -292,6 +318,20 @@ const StyledTextStyle = TextStyle.extend({
           ? { style: `font-size: ${attributes.presetFontSize}` }
           : {},
       },
+      fontFamily: {
+        default: null,
+        parseHTML: (element) => element.style.fontFamily || null,
+        renderHTML: (attributes) => attributes.fontFamily
+          ? { style: `font-family: ${attributes.fontFamily}` }
+          : {},
+      },
+      fontSize: {
+        default: null,
+        parseHTML: (element) => element.style.fontSize || null,
+        renderHTML: (attributes) => attributes.fontSize
+          ? { style: `font-size: ${attributes.fontSize}` }
+          : {},
+      },
     }
   },
 })
@@ -368,7 +408,7 @@ function createDeckDocument(name = DEFAULT_DECK_NAME): DeckDocument {
   const firstCard: CardState = {
     id: generateDeckId(),
     name: 'Carta 1',
-    deckObjects: [],
+    canvas: createEmptyCanvasState(),
     modelId: model.id,
     backId: back.id,
     modelOverrides: {},
@@ -423,6 +463,14 @@ function normalizeTextAlign(value: unknown, fallback: TextAlignMode = 'left'): T
   return isTextAlignMode(value) ? value : fallback
 }
 
+function normalizeTextVerticalAlign(value: unknown): TextVerticalAlignMode {
+  return value === 'middle' || value === 'bottom' ? value : 'top'
+}
+
+function normalizeTextOverflow(value: unknown): TextOverflowMode {
+  return value === 'clip' ? 'clip' : 'expand'
+}
+
 function extractShadowOverride(value: unknown): ShadowOverride | null | undefined {
   if (value == null) {
     return null
@@ -448,7 +496,11 @@ function extractShadowOverride(value: unknown): ShadowOverride | null | undefine
 
 function readTextPropsFromSerialized(record: Record<string, unknown>): CardTextPropsOverride {
   const output: CardTextPropsOverride = {}
+  const data = record['data'] && typeof record['data'] === 'object'
+    ? record['data'] as Partial<LayerMeta>
+    : {}
 
+  if (typeof record['width'] === 'number') output.width = record['width']
   if (typeof record['fontFamily'] === 'string') output.fontFamily = record['fontFamily']
   if (typeof record['fontSize'] === 'number') output.fontSize = record['fontSize']
   if (typeof record['fontWeight'] === 'string' || typeof record['fontWeight'] === 'number') {
@@ -462,6 +514,11 @@ function readTextPropsFromSerialized(record: Record<string, unknown>): CardTextP
   if (typeof record['stroke'] === 'string') output.stroke = record['stroke']
   if (typeof record['strokeWidth'] === 'number') output.strokeWidth = record['strokeWidth']
   if (isTextAlignMode(record['textAlign'])) output.textAlign = record['textAlign']
+  if (data.textVerticalAlign === 'top' || data.textVerticalAlign === 'middle' || data.textVerticalAlign === 'bottom') {
+    output.textVerticalAlign = data.textVerticalAlign
+  }
+  if (data.textOverflow === 'expand' || data.textOverflow === 'clip') output.textOverflow = data.textOverflow
+  if (typeof data.textBoxHeight === 'number') output.textBoxHeight = data.textBoxHeight
   if (typeof record['lineHeight'] === 'number') output.lineHeight = record['lineHeight']
 
   const shadow = extractShadowOverride(record['shadow'])
@@ -481,6 +538,7 @@ function diffCardTextProps(
   const diff: CardTextPropsOverride = {}
 
   const keys: Array<keyof CardTextPropsOverride> = [
+    'width',
     'fontFamily',
     'fontSize',
     'fontWeight',
@@ -492,6 +550,9 @@ function diffCardTextProps(
     'stroke',
     'strokeWidth',
     'textAlign',
+    'textVerticalAlign',
+    'textOverflow',
+    'textBoxHeight',
     'lineHeight',
     'shadow',
   ]
@@ -673,12 +734,12 @@ function parseHtmlRichText(
   fallbackColor: string,
 ): {
   text: string
-  styles: Record<number, Record<number, { fill?: string; textBackgroundColor?: string; textBackgroundRadius?: number; textBackgroundPaddingX?: number; textBackgroundPaddingY?: number; fontSize?: number; fontWeight?: string; fontStyle?: string; underline?: boolean }>>
+  styles: Record<number, Record<number, { fill?: string; textBackgroundColor?: string; textBackgroundRadius?: number; textBackgroundPaddingX?: number; textBackgroundPaddingY?: number; fontFamily?: string; fontSize?: number; fontWeight?: string; fontStyle?: string; underline?: boolean }>>
 } {
   const parser = new DOMParser()
   const doc = parser.parseFromString(`<div>${html}</div>`, 'text/html')
   const root = doc.body.firstElementChild
-  const styles: Record<number, Record<number, { fill?: string; textBackgroundColor?: string; textBackgroundRadius?: number; textBackgroundPaddingX?: number; textBackgroundPaddingY?: number; fontSize?: number; fontWeight?: string; fontStyle?: string; underline?: boolean }>> = {}
+  const styles: Record<number, Record<number, { fill?: string; textBackgroundColor?: string; textBackgroundRadius?: number; textBackgroundPaddingX?: number; textBackgroundPaddingY?: number; fontFamily?: string; fontSize?: number; fontWeight?: string; fontStyle?: string; underline?: boolean }>> = {}
 
   if (!root) {
     return { text: '', styles }
@@ -690,7 +751,7 @@ function parseHtmlRichText(
 
   const appendText = (
     chunk: string,
-    style: { fill?: string; textBackgroundColor?: string; textBackgroundRadius?: number; textBackgroundPaddingX?: number; textBackgroundPaddingY?: number; fontSize?: number; fontWeight?: string; fontStyle?: string; underline?: boolean },
+    style: { fill?: string; textBackgroundColor?: string; textBackgroundRadius?: number; textBackgroundPaddingX?: number; textBackgroundPaddingY?: number; fontFamily?: string; fontSize?: number; fontWeight?: string; fontStyle?: string; underline?: boolean },
   ): void => {
     for (const char of chunk) {
       output += char
@@ -700,7 +761,7 @@ function parseHtmlRichText(
         continue
       }
 
-      const hasStyle = Boolean(style.fill || style.textBackgroundColor || style.textBackgroundRadius || style.textBackgroundPaddingX || style.textBackgroundPaddingY || style.fontSize || style.fontWeight || style.fontStyle || style.underline)
+      const hasStyle = Boolean(style.fill || style.textBackgroundColor || style.textBackgroundRadius || style.textBackgroundPaddingX || style.textBackgroundPaddingY || style.fontFamily || style.fontSize || style.fontWeight || style.fontStyle || style.underline)
       if (hasStyle) {
         styles[lineIndex] ??= {}
         styles[lineIndex][charIndex] = {
@@ -709,6 +770,7 @@ function parseHtmlRichText(
           ...(style.textBackgroundRadius ? { textBackgroundRadius: style.textBackgroundRadius } : {}),
           ...(style.textBackgroundPaddingX ? { textBackgroundPaddingX: style.textBackgroundPaddingX } : {}),
           ...(style.textBackgroundPaddingY ? { textBackgroundPaddingY: style.textBackgroundPaddingY } : {}),
+          ...(style.fontFamily ? { fontFamily: style.fontFamily } : {}),
           ...(style.fontSize ? { fontSize: style.fontSize } : {}),
           ...(style.fontWeight ? { fontWeight: style.fontWeight } : {}),
           ...(style.fontStyle ? { fontStyle: style.fontStyle } : {}),
@@ -722,7 +784,7 @@ function parseHtmlRichText(
 
   const walk = (
     node: Node,
-    inherited: { fill?: string; textBackgroundColor?: string; textBackgroundRadius?: number; textBackgroundPaddingX?: number; textBackgroundPaddingY?: number; fontSize?: number; fontWeight?: string; fontStyle?: string; underline?: boolean },
+    inherited: { fill?: string; textBackgroundColor?: string; textBackgroundRadius?: number; textBackgroundPaddingX?: number; textBackgroundPaddingY?: number; fontFamily?: string; fontSize?: number; fontWeight?: string; fontStyle?: string; underline?: boolean },
   ): void => {
     if (node.nodeType === Node.TEXT_NODE) {
       appendText(node.textContent ?? '', inherited)
@@ -752,6 +814,7 @@ function parseHtmlRichText(
     const inlinePaddingY = paddingParts[0]
     const inlinePaddingX = paddingParts[1] ?? paddingParts[0]
     const inlineFontSize = Number.parseFloat(node.style.fontSize)
+    const inlineFontFamily = node.style.fontFamily.replace(/^['"]|['"]$/g, '')
     const inlineWeight = node.style.fontWeight
     const inlineStyle = node.style.fontStyle
     const textDecoration = node.style.textDecoration
@@ -762,6 +825,7 @@ function parseHtmlRichText(
     if (Number.isFinite(inlinePaddingX)) style.textBackgroundPaddingX = Math.max(0, inlinePaddingX)
     if (Number.isFinite(inlinePaddingY)) style.textBackgroundPaddingY = Math.max(0, inlinePaddingY)
     if (Number.isFinite(inlineFontSize)) style.fontSize = Math.max(1, inlineFontSize)
+    if (inlineFontFamily) style.fontFamily = inlineFontFamily
     if (inlineWeight) style.fontWeight = inlineWeight
     if (inlineStyle) style.fontStyle = inlineStyle
     if (textDecoration.includes('underline')) style.underline = true
@@ -807,6 +871,105 @@ function applyRichTextToObject(
     richTextFormat: format,
   })
   textObject.setCoords()
+}
+
+function createTextLayoutControls(
+  textObject: FabricText | Textbox,
+  commit: () => void,
+): DocumentFragment {
+  const fragment = document.createDocumentFragment()
+  const readMeta = (): LayerMeta => getLayerMeta(textObject)
+  const apply = (changes: Partial<Pick<LayerMeta, 'textVerticalAlign' | 'textOverflow' | 'textBoxHeight'>>): void => {
+    const meta = readMeta()
+    const next = { ...meta, ...changes }
+    const minimumHeight = Math.max(20, next.textBoxHeight ?? textObject.height ?? 40)
+    setLayerMeta(textObject, { ...next, textBoxHeight: minimumHeight })
+    textObject.initDimensions()
+    textObject.setCoords()
+    commit()
+  }
+
+  const horizontalAlign = document.createElement('select')
+  ;([
+    ['left', 'Esquerda'],
+    ['center', 'Centro'],
+    ['right', 'Direita'],
+  ] as Array<[TextAlignMode, string]>).forEach(([value, label]) => {
+    const option = document.createElement('option')
+    option.value = value
+    option.textContent = label
+    const savedAlign = normalizeTextAlign((textObject as { textAlign?: unknown }).textAlign, 'left')
+    option.selected = (savedAlign === 'justify' ? 'left' : savedAlign) === value
+    horizontalAlign.append(option)
+  })
+  attachNoDragPropagation(horizontalAlign)
+  horizontalAlign.addEventListener('change', () => {
+    textObject.set({ textAlign: horizontalAlign.value as TextAlignMode })
+    textObject.initDimensions()
+    textObject.setCoords()
+    commit()
+  })
+  fragment.append(detailsRow('Alinhamento horizontal', horizontalAlign))
+
+  const verticalAlign = document.createElement('select')
+  ;([
+    ['top', 'Topo'],
+    ['middle', 'Meio'],
+    ['bottom', 'Base'],
+  ] as Array<[TextVerticalAlignMode, string]>).forEach(([value, label]) => {
+    const option = document.createElement('option')
+    option.value = value
+    option.textContent = label
+    option.selected = normalizeTextVerticalAlign(readMeta().textVerticalAlign) === value
+    verticalAlign.append(option)
+  })
+  attachNoDragPropagation(verticalAlign)
+  verticalAlign.addEventListener('change', () => apply({ textVerticalAlign: verticalAlign.value as TextVerticalAlignMode }))
+  fragment.append(detailsRow('Alinhamento vertical', verticalAlign))
+
+  const overflow = document.createElement('select')
+  ;([
+    ['expand', 'Expandir caixa'],
+    ['clip', 'Cortar excedente'],
+  ] as Array<[TextOverflowMode, string]>).forEach(([value, label]) => {
+    const option = document.createElement('option')
+    option.value = value
+    option.textContent = label
+    option.selected = normalizeTextOverflow(readMeta().textOverflow) === value
+    overflow.append(option)
+  })
+  attachNoDragPropagation(overflow)
+  overflow.addEventListener('change', () => apply({ textOverflow: overflow.value as TextOverflowMode }))
+  fragment.append(detailsRow('Texto excedente', overflow))
+
+  if (textObject instanceof Textbox) {
+    const width = document.createElement('input')
+    width.type = 'number'
+    width.min = '40'
+    width.max = '800'
+    width.step = '1'
+    width.value = String(Math.round(textObject.width ?? 260))
+    attachNoDragPropagation(width)
+    width.addEventListener('change', () => {
+      textObject.set({ width: clamp(40, 800, Number(width.value) || 260) })
+      textObject.initDimensions()
+      textObject.setCoords()
+      commit()
+    })
+    fragment.append(detailsRow('Largura da caixa', width))
+
+    const height = document.createElement('input')
+    height.type = 'number'
+    height.min = '20'
+    height.max = '800'
+    height.step = '1'
+    height.value = String(Math.round(readMeta().textBoxHeight ?? textObject.height ?? 40))
+    attachNoDragPropagation(height)
+    height.addEventListener('change', () => apply({ textBoxHeight: clamp(20, 800, Number(height.value) || 40) }))
+    fragment.append(detailsRow('Altura da caixa', height))
+  }
+
+  return fragment
 }
 
 function installRoundedTextBackgroundRenderer(): void {
@@ -887,6 +1050,90 @@ function installRoundedTextBackgroundRenderer(): void {
 }
 
 installRoundedTextBackgroundRenderer()
+
+function installTextBoxLayoutRenderer(): void {
+  const textboxPrototype = Textbox.prototype as unknown as Record<string, unknown>
+  const originalCreateControls = Textbox.createControls
+  if (!textboxPrototype['_fixedTextBoxControlsInstalled']) {
+    textboxPrototype['_fixedTextBoxControlsInstalled'] = true
+    Textbox.createControls = () => {
+      const controls = originalCreateControls.call(Textbox)
+      const textControls = controls.controls
+      const resizeHeight: typeof controlsUtils.changeHeight = (...args) => {
+        const target = args[1].target as Textbox & { resizingTextBoxHeight?: boolean; data?: LayerMeta }
+        target.resizingTextBoxHeight = true
+        let changed = false
+        try {
+          changed = controlsUtils.changeHeight(...args)
+        } finally {
+          target.resizingTextBoxHeight = false
+        }
+        if (changed && target.data) {
+          target.data.textBoxHeight = Math.max(20, target.height ?? 20)
+          target.initDimensions()
+          target.setCoords()
+        }
+        return changed
+      }
+      textControls.mt = new Control({ x: 0, y: -0.5, actionHandler: resizeHeight, actionName: 'resizing' })
+      textControls.mb = new Control({ x: 0, y: 0.5, actionHandler: resizeHeight, actionName: 'resizing' })
+      textControls.tl.visible = false
+      textControls.tr.visible = false
+      textControls.bl.visible = false
+      textControls.br.visible = false
+      return controls
+    }
+  }
+
+  const originalInitDimensions = textboxPrototype['initDimensions'] as (() => void) | undefined
+  if (originalInitDimensions && !textboxPrototype['_fixedTextBoxHeightInstalled']) {
+    textboxPrototype['_fixedTextBoxHeightInstalled'] = true
+    textboxPrototype['initDimensions'] = function (this: any): void {
+      originalInitDimensions.call(this)
+      const data = this.data as Partial<LayerMeta> | undefined
+      if (!data || this.resizingTextBoxHeight) return
+
+      const requestedHeight = Number(data.textBoxHeight)
+      const minimumHeight = Number.isFinite(requestedHeight) && requestedHeight > 0 ? requestedHeight : this.height
+      data.textBoxHeight = minimumHeight
+      this.height = normalizeTextOverflow(data.textOverflow) === 'clip'
+        ? minimumHeight
+        : Math.max(minimumHeight, this.height)
+    }
+  }
+
+  const textPrototype = FabricText.prototype as unknown as Record<string, unknown>
+  const originalRender = textPrototype['_render'] as ((ctx: CanvasRenderingContext2D) => void) | undefined
+  if (!originalRender || textPrototype['_textBoxLayoutRendererInstalled']) return
+
+  textPrototype['_textBoxLayoutRendererInstalled'] = true
+  textPrototype['_render'] = function (this: any, ctx: CanvasRenderingContext2D): void {
+    const data = this.data as Partial<LayerMeta> | undefined
+    if (!data) {
+      originalRender.call(this, ctx)
+      return
+    }
+
+    const boxWidth = Math.max(1, Number(this.width) || 1)
+    const boxHeight = Math.max(1, Number(this.height) || 1)
+    const contentHeight = Math.max(0, Number(this.calcTextHeight?.()) || boxHeight)
+    const remainingHeight = Math.max(0, boxHeight - contentHeight)
+    const verticalAlign = normalizeTextVerticalAlign(data.textVerticalAlign)
+    const verticalOffset = verticalAlign === 'middle' ? remainingHeight / 2 : verticalAlign === 'bottom' ? remainingHeight : 0
+
+    ctx.save()
+    if (normalizeTextOverflow(data.textOverflow) === 'clip') {
+      ctx.beginPath()
+      ctx.rect(-boxWidth / 2, -boxHeight / 2, boxWidth, boxHeight)
+      ctx.clip()
+    }
+    if (verticalOffset > 0) ctx.translate(0, verticalOffset)
+    originalRender.call(this, ctx)
+    ctx.restore()
+  }
+}
+
+installTextBoxLayoutRenderer()
 
 function wrapSelectionWithTag(textarea: HTMLTextAreaElement, tag: string): void {
   const start = textarea.selectionStart ?? 0
@@ -1188,6 +1435,7 @@ function createImageBehaviorControls(object: FabricImage): DocumentFragment {
     { value: 'scale-down', label: 'Reduzir se necessário (scale-down)' },
   ]
   const currentFit = normalizeImageFit(getLayerMeta(object).fit ?? 'contain')
+  fitField.disabled = Boolean(getLayerMeta(object).locked || getLayerMeta(object).isBackground)
   fitOptions.forEach(({ value, label }) => {
     const option = document.createElement('option')
     option.value = value
@@ -1224,7 +1472,7 @@ function createImageBehaviorControls(object: FabricImage): DocumentFragment {
     const layerId = getLayerMeta(object).id
     const enabled = normalizeImageFit(fitField.value, 'contain') === 'cover'
     const active = cropPanLayerId === layerId
-    cropButton.disabled = !enabled
+    cropButton.disabled = !enabled || Boolean(getLayerMeta(object).locked || getLayerMeta(object).isBackground)
     cropButton.classList.toggle('is-active', active)
     cropButton.textContent = active ? 'Concluir enquadramento' : 'Arrastar enquadramento'
   }
@@ -1247,7 +1495,7 @@ function createImageBehaviorControls(object: FabricImage): DocumentFragment {
     const file = fileField.files?.[0]
     if (!file) return
     try {
-      const dataUrl = await fileToDataUrl(file)
+      const dataUrl = await fileToObjectUrl(file)
       const selectedFit = normalizeImageFit(getLayerMeta(object).fit ?? fitField.value, 'contain')
       await replaceIllustrationOnObject(object, dataUrl, selectedFit)
       canvas.requestRenderAll()
@@ -1304,7 +1552,7 @@ function collectCardModelOverrides(
 
     const data = current['data'] as Partial<LayerMeta> | undefined
     const kind = data?.kind
-    if (kind !== 'text' && kind !== 'image') continue
+    if (kind !== 'text' && kind !== 'image' && kind !== 'base') continue
 
     const base = baseById.get(id)
     if (!base) continue
@@ -1342,6 +1590,10 @@ function collectCardModelOverrides(
 
     const currentSrc = typeof current['src'] === 'string' ? current['src'] : ''
     const baseSrc = typeof base['src'] === 'string' ? base['src'] : ''
+    const hiddenChanged = kind === 'base' && current['visible'] !== base['visible']
+    const hiddenOverride = kind === 'base' && typeof current['visible'] === 'boolean'
+      ? { hidden: current['visible'] === false }
+      : {}
     const currentFit = isImageFitMode(data?.fit) ? data.fit : undefined
     const baseData = base['data'] as Partial<LayerMeta> | undefined
     const currentCropX = typeof data?.cropPositionX === 'number' ? data.cropPositionX : 0.5
@@ -1351,12 +1603,12 @@ function collectCardModelOverrides(
     const cropChanged = Math.abs(currentCropX - baseCropX) > 0.0001 || Math.abs(currentCropY - baseCropY) > 0.0001
     const cropOverride = cropChanged ? { cropPositionX: currentCropX, cropPositionY: currentCropY } : {}
     if (currentSrc && currentSrc !== baseSrc) {
-      overrides[id] = { src: currentSrc, fit: currentFit, ...cropOverride }
+      overrides[id] = { src: currentSrc, fit: currentFit, ...cropOverride, ...hiddenOverride }
       continue
     }
 
-    if (currentFit || cropChanged) {
-      overrides[id] = { fit: currentFit, ...cropOverride }
+    if (currentFit || cropChanged || hiddenChanged) {
+      overrides[id] = { fit: currentFit, ...cropOverride, ...hiddenOverride }
     }
   }
 
@@ -1365,6 +1617,28 @@ function collectCardModelOverrides(
 
 function cloneCanvasState(state: ReturnType<Canvas['toObject']>): ReturnType<Canvas['toObject']> {
   return JSON.parse(JSON.stringify(state)) as ReturnType<Canvas['toObject']>
+}
+
+function createCardCanvasFromModel(model: CardModel): ReturnType<Canvas['toObject']> {
+  const state = cloneCanvasState(model.canvas)
+  const objects = (state.objects ?? []) as Array<Record<string, unknown>>
+  return {
+    ...state,
+    objects: objects.map((object) => {
+      const data = object['data'] as Partial<LayerMeta> | undefined
+      const wasBase = data?.kind === 'base'
+      return {
+        ...object,
+        data: {
+          ...data,
+          id: generateLayerId(),
+          kind: wasBase ? 'image' : data?.kind,
+          scope: 'deck',
+          isBackground: wasBase || data?.isBackground === true,
+        },
+      }
+    }) as ReturnType<Canvas['toObject']>['objects'],
+  }
 }
 
 function currentDeck(): DeckDocument {
@@ -1524,11 +1798,14 @@ function persistActiveDeckDocument(): void {
 
   const card = deck.cards.find(c => c.id === deck.activeCardId)
   if (card) {
-    card.modelOverrides = collectCardModelOverrides(
-      (modelOfCard(deck, card).canvas.objects ?? []) as unknown[],
-      modelObjects,
-    )
-    card.deckObjects = all.filter(o => o.data?.scope !== 'model') as unknown[]
+    if (!card.canvas) {
+      card.modelOverrides = collectCardModelOverrides(
+        (modelOfCard(deck, card).canvas.objects ?? []) as unknown[],
+        modelObjects,
+      )
+    }
+    card.canvas = { ...snapshot }
+    card.deckObjects = undefined
     try {
       card.thumbnail = captureCardThumbnail()
     } catch {
@@ -1539,6 +1816,7 @@ function persistActiveDeckDocument(): void {
 
 function buildCardCanvasState(deck: DeckDocument, cardId: string): ReturnType<Canvas['toObject']> {
   const card = deck.cards.find(c => c.id === cardId) ?? deck.cards[0]
+  if (card?.canvas) return cloneCanvasState(card.canvas)
   const cardModelCanvas = modelOfCard(deck, card).canvas
   const modelObjects = deepClone((cardModelCanvas.objects ?? []) as Array<Record<string, unknown>>)
 
@@ -1564,11 +1842,29 @@ function buildCardCanvasState(deck: DeckDocument, cardId: string): ReturnType<Ca
       }
 
       if (override.textProps) {
-        const changed = override.textProps as Record<string, unknown>
-        Object.keys(changed).forEach((key) => {
-          object[key] = changed[key]
+        const changed = { ...override.textProps } as Record<string, unknown>
+        const existingData = object['data'] && typeof object['data'] === 'object'
+          ? object['data'] as Record<string, unknown>
+          : {}
+        const nextData = { ...existingData }
+        ;(['textVerticalAlign', 'textOverflow', 'textBoxHeight'] as const).forEach((key) => {
+          if (Object.hasOwn(changed, key)) {
+            nextData[key] = changed[key]
+            delete changed[key]
+          }
         })
+        if (typeof nextData['textBoxHeight'] === 'number') {
+          object['height'] = nextData['textOverflow'] === 'clip'
+            ? nextData['textBoxHeight']
+            : Math.max(Number(object['height']) || 0, nextData['textBoxHeight'])
+        }
+        Object.assign(object, changed)
+        object['data'] = nextData
       }
+    }
+
+    if (kind === 'base' && typeof override.hidden === 'boolean') {
+      object['visible'] = !override.hidden
     }
 
     if (typeof override.src === 'string' && override.src && override.src !== object['src']) {
@@ -1623,11 +1919,11 @@ async function loadActiveModelIntoEditor(): Promise<void> {
   const deck = currentDeck()
   canvas.clear()
   layerById.clear()
-  baseLayerId = ''
   await canvas.loadFromJSON(activeModelOf(deck).canvas)
+  syncCanvasFrame()
   canvas.getObjects().forEach(obj => {
     const meta = getLayerMeta(obj)
-    if (meta.kind === 'base') baseLayerId = meta.id
+    if (meta.kind === 'base') setLayerMeta(obj, { ...meta, kind: 'image', isBackground: true })
     applyRuntimeConfig(obj)
   })
   refreshLayerIndex()
@@ -1684,16 +1980,6 @@ async function decompressDeckText(file: File): Promise<string> {
   }
 
   return new TextDecoder().decode(buffer)
-}
-
-async function compressTextToBlob(text: string): Promise<Blob> {
-  if (typeof CompressionStream === 'undefined') {
-    return new Blob([text], { type: 'application/json' })
-  }
-
-  const stream = new Blob([text]).stream().pipeThrough(new CompressionStream('gzip'))
-  const buffer = await new Response(stream).arrayBuffer()
-  return new Blob([buffer], { type: 'application/gzip' })
 }
 
 function downloadBlob(filename: string, blob: Blob): void {
@@ -1757,7 +2043,8 @@ function migrateDeckDocument(raw: Record<string, unknown>): DeckDocument {
 
   const cards: CardState[] = rawCards.map((card, index) => ({
     id: card.id || generateDeckId(),
-    name: card.name || `Carta ${index + 1}`,
+    name: normalizeCardName(card.name || `Carta ${index + 1}`),
+    canvas: card.canvas && typeof card.canvas === 'object' ? card.canvas as ReturnType<Canvas['toObject']> : undefined,
     deckObjects: Array.isArray(card.deckObjects) ? card.deckObjects : [],
     modelId: models.some(m => m.id === card.modelId) ? card.modelId as string : models[0].id,
     backId: backs.some(b => b.id === card.backId) ? card.backId as string : backs[0].id,
@@ -1767,7 +2054,7 @@ function migrateDeckDocument(raw: Record<string, unknown>): DeckDocument {
   const requestedActive = typeof raw['activeCardId'] === 'string' ? raw['activeCardId'] : ''
   const activeCard = cards.find(c => c.id === requestedActive) ?? cards[0]
 
-  return {
+  const migratedDeck: DeckDocument = {
     id: (raw['id'] as string | undefined) ?? generateDeckId(),
     name: (raw['name'] as string | undefined) ?? DEFAULT_DECK_NAME,
     models,
@@ -1792,6 +2079,30 @@ function migrateDeckDocument(raw: Record<string, unknown>): DeckDocument {
     activeCardId: activeCard.id,
     cover: typeof raw['cover'] === 'string' ? raw['cover'] : '',
   }
+
+  migratedDeck.cards.forEach((card) => {
+    if (!card.canvas) card.canvas = buildCardCanvasState(migratedDeck, card.id)
+    const objects = (card.canvas.objects ?? []) as Array<Record<string, unknown>>
+    card.canvas = {
+      ...card.canvas,
+      objects: objects.map((object) => {
+        const data = object['data'] as Partial<LayerMeta> | undefined
+        const wasBase = data?.kind === 'base'
+        return {
+          ...object,
+          data: {
+            ...data,
+            kind: wasBase ? 'image' : data?.kind,
+            scope: 'deck',
+            isBackground: wasBase || data?.isBackground === true,
+          },
+        }
+      }) as ReturnType<Canvas['toObject']>['objects'],
+    }
+    card.deckObjects = []
+    card.modelOverrides = {}
+  })
+  return migratedDeck
 }
 
 function deckFileSnapshot(): { version: 1; deck: DeckDocument } {
@@ -1804,18 +2115,18 @@ function deckFileSnapshot(): { version: 1; deck: DeckDocument } {
       id: deck.id,
       name: deck.name,
       models: deck.models.map(m => ({ id: m.id, name: m.name, canvas: cloneCanvasState(m.canvas) })),
-      backs: deck.backs.map(b => ({ id: b.id, name: b.name, canvas: cloneCanvasState(b.canvas), thumbnail: b.thumbnail })),
+      backs: deck.backs.map(b => ({ id: b.id, name: b.name, canvas: cloneCanvasState(b.canvas), thumbnail: '' })),
       library: deck.library.map(a => ({ ...a })),
       activeModelId: deck.activeModelId,
       activeBackId: deck.activeBackId,
       cards: deck.cards.map(c => ({
         id: c.id,
         name: c.name,
-        deckObjects: JSON.parse(JSON.stringify(c.deckObjects)) as unknown[],
+        canvas: c.canvas ? cloneCanvasState(c.canvas) : undefined,
         modelId: c.modelId,
         backId: c.backId,
-        modelOverrides: JSON.parse(JSON.stringify(c.modelOverrides)) as Record<string, CardModelOverride>,
-        thumbnail: c.thumbnail,
+        modelOverrides: {},
+        thumbnail: '',
       })),
       activeCardId: deck.activeCardId,
       cover: deck.cover ?? '',
@@ -1905,33 +2216,25 @@ app.innerHTML = `
       </section>
     </div>
     <div class="library-launcher">
-      <button id="openModelToolsButton" class="library-launch-button" type="button" hidden>
-        <span class="material-symbols-outlined" aria-hidden="true">tune</span>
-        <span>Ferramentas</span>
-      </button>
-      <button id="openLibraryButton" class="library-launch-button" type="button">
+      <button id="openAssetsButton" class="library-launch-button" type="button">
         <span class="material-symbols-outlined" aria-hidden="true">collections</span>
-        <span>Biblioteca gráfica</span>
+        <span>Assets</span>
       </button>
     </div>
     </div>
   </section>
 
-  <div id="modelToolsModal" class="print-modal" hidden>
-    <div id="modelToolsModalBackdrop" class="print-modal-backdrop"></div>
-    <section class="print-modal-dialog model-tools-modal-dialog" role="dialog" aria-modal="true" aria-labelledby="modelToolsModalTitle">
+  <div id="assetsModal" class="print-modal" hidden>
+    <div id="assetsModalBackdrop" class="print-modal-backdrop"></div>
+    <section class="print-modal-dialog assets-modal-dialog" role="dialog" aria-modal="true" aria-labelledby="assetsModalTitle">
       <header class="print-modal-header">
-        <h2 id="modelToolsModalTitle">Ferramentas do modelo</h2>
-        <button id="closeModelToolsButton" class="ghost tiny" type="button" aria-label="Fechar ferramentas">Fechar</button>
+        <h2 id="assetsModalTitle">Assets</h2>
+        <button id="closeAssetsButton" class="ghost tiny" type="button" aria-label="Fechar assets">Fechar</button>
       </header>
-      <div id="modelTools" class="model-tools">
-        <div class="control-block">
-          <h2>Fundo da carta</h2>
-          <button id="changeBaseButton" class="ghost" type="button">Trocar fundo</button>
-          <input id="baseImageInput" type="file" accept="image/*" hidden />
-        </div>
-        <div class="control-block">
-          <h2>Adicionar ao modelo</h2>
+      <div class="assets-modal-content">
+        <div id="modelTools" class="model-tools">
+          <div class="control-block">
+            <h2>Adicionar layer</h2>
           <div class="row two">
             <button id="addGraphicButton" class="primary" type="button">+ Imagem</button>
             <button id="addTextButton" class="ghost" type="button">+ Texto</button>
@@ -1939,9 +2242,9 @@ app.innerHTML = `
           <input id="imageInput" type="file" accept="image/*" hidden />
           <p class="hint">Para trocar uma imagem, selecione-a e dê duplo clique, ou use o painel de edição. Também dá para soltar imagens na carta.</p>
         </div>
-        <div class="control-block">
-          <h2>Formas</h2>
-          <div id="shapePalette" class="shape-palette">
+          <div class="control-block">
+            <h2>Formas</h2>
+            <div id="shapePalette" class="shape-palette">
             <button class="ghost" type="button" data-shape="rect">Retângulo</button>
             <button class="ghost" type="button" data-shape="rounded">Arredondado</button>
             <button class="ghost" type="button" data-shape="ellipse">Círculo</button>
@@ -1951,26 +2254,19 @@ app.innerHTML = `
             <button class="ghost" type="button" data-shape="hexagon">Hexágono</button>
             <button class="ghost" type="button" data-shape="star">Estrela</button>
             <button class="ghost" type="button" data-shape="line">Linha</button>
+            </div>
+            <p class="hint">Selecione a forma e edite preenchimento, contorno, cantos e tamanho no painel de edição.</p>
           </div>
-          <p class="hint">Selecione a forma e edite preenchimento, contorno, cantos e tamanho no painel de edição.</p>
         </div>
+        <section class="assets-library">
+          <div class="library-modal-toolbar">
+            <div><h3>Biblioteca gráfica</h3><p id="libraryHint" class="hint"></p></div>
+            <button id="libraryUploadButton" class="primary" type="button">+ Adicionar à biblioteca</button>
+            <input id="libraryInput" type="file" accept="image/*" multiple hidden />
+          </div>
+          <div id="libraryGrid" class="library-grid"></div>
+        </section>
       </div>
-    </section>
-  </div>
-
-  <div id="libraryModal" class="print-modal" hidden>
-    <div id="libraryModalBackdrop" class="print-modal-backdrop"></div>
-    <section class="print-modal-dialog library-modal-dialog" role="dialog" aria-modal="true" aria-labelledby="libraryModalTitle">
-      <header class="print-modal-header">
-        <h2 id="libraryModalTitle">Biblioteca de gráficos</h2>
-        <button id="closeLibraryButton" class="ghost tiny" type="button" aria-label="Fechar biblioteca">Fechar</button>
-      </header>
-      <div class="library-modal-toolbar">
-        <p id="libraryHint" class="hint"></p>
-        <button id="libraryUploadButton" class="primary" type="button">+ Adicionar à biblioteca</button>
-        <input id="libraryInput" type="file" accept="image/*" multiple hidden />
-      </div>
-      <div id="libraryGrid" class="library-grid"></div>
     </section>
   </div>
 
@@ -1997,26 +2293,33 @@ app.innerHTML = `
     </div>
   </section>
 
+  <div id="deckPanelResizer" class="panel-resizer deck-panel-resizer" role="separator" aria-label="Redimensionar coluna de cartas" aria-orientation="vertical" tabindex="0"></div>
+
+  <section id="cardsSection" class="panel cards-panel deck-preview-panel">
+    <header class="deck-preview-header">
+      <div>
+        <h2>Baralho / Deck</h2>
+        <p class="subtitle compact" id="cardCountLabel"></p>
+      </div>
+      <button id="addCardButton" class="primary tiny" type="button" aria-label="Adicionar carta" title="Adicionar carta">+</button>
+    </header>
+    <div id="cardThumbnails" class="card-thumbnails"></div>
+  </section>
+
   <div id="rightPanelResizer" class="panel-resizer" role="separator" aria-label="Redimensionar painel lateral" aria-orientation="vertical" tabindex="0"></div>
 
   <div class="right-panel-host">
     <div class="right-panel-tab-bar">
-      <button id="editDeckButton" class="tab-button is-active" type="button">Baralho</button>
+      <button id="editDeckButton" class="tab-button is-active" type="button" role="switch" aria-checked="true" aria-label="Ocultar coluna Baralho" title="Ocultar coluna Baralho">Baralho</button>
       <button id="editModelButton" class="tab-button" type="button">Modelo</button>
       <button id="editBackButton" class="tab-button" type="button" title="Background (verso das cartas)">Verso</button>
     </div>
-    <section id="cardsSection" class="panel cards-panel">
-      <h2>Baralho / Deck</h2>
-      <p class="subtitle compact" id="cardCountLabel"></p>
-      <div id="cardVariantControls" class="card-variant-controls">
+    <section id="layersSection" class="panel layers-panel" hidden>
+      <h2 id="layersSectionTitle">Modelo</h2>
+      <div id="cardVariantControls" class="card-variant-controls" hidden>
         <label>Modelo desta carta<select id="cardModelSelect"></select></label>
         <label>Verso desta carta<select id="cardBackSelect"></select></label>
       </div>
-      <div id="cardThumbnails" class="card-thumbnails"></div>
-      <button id="addCardButton" class="primary" type="button">+ Adicionar carta</button>
-    </section>
-    <section id="layersSection" class="panel layers-panel" hidden>
-      <h2 id="layersSectionTitle">Modelo</h2>
       <div id="variantBar" class="variant-bar">
         <input id="variantNameInput" type="text" maxlength="60" aria-label="Nome" placeholder="Nome" />
         <select id="variantSelect" aria-label="Selecionar variação"></select>
@@ -2047,11 +2350,11 @@ app.innerHTML = `
     <div class="tutorial-steps">
       <article class="tutorial-step">
         <span class="tutorial-step-number">01</span>
-        <div><h3>Escolha um modelo</h3><p>Clique em <strong>Modelos prontos</strong>, compare as composições e aplique a que combina com seu jogo. O modelo define a estrutura usada por todas as cartas.</p></div>
+        <div><h3>Escolha um modelo</h3><p>Clique em <strong>Modelos prontos</strong> para criar uma estrutura inicial. Cada carta recebe sua própria cópia dos layers.</p></div>
       </article>
       <article class="tutorial-step">
         <span class="tutorial-step-number">02</span>
-        <div><h3>Ajuste a estrutura</h3><p>Na aba <strong>Modelo</strong>, selecione os layers para mover, redimensionar ou reordenar título, ilustração, tipo, descrição e atributos.</p></div>
+        <div><h3>Ajuste a estrutura</h3><p>Na aba <strong>Modelo</strong>, edite a referência usada ao criar cartas. Alterações no modelo não afetam cartas existentes.</p></div>
       </article>
       <article class="tutorial-step">
         <span class="tutorial-step-number">03</span>
@@ -2244,23 +2547,17 @@ function requireElement<T extends Element>(root: ParentNode, selector: string): 
 
 const addTextButton = requireElement<HTMLButtonElement>(app, '#addTextButton')
 const shapePalette = requireElement<HTMLDivElement>(app, '#shapePalette')
-const openModelToolsButton = requireElement<HTMLButtonElement>(app, '#openModelToolsButton')
+const openAssetsButton = requireElement<HTMLButtonElement>(app, '#openAssetsButton')
 const libraryLauncher = requireElement<HTMLDivElement>(app, '.library-launcher')
-const modelToolsModal = requireElement<HTMLDivElement>(app, '#modelToolsModal')
-const closeModelToolsButton = requireElement<HTMLButtonElement>(app, '#closeModelToolsButton')
-const modelToolsModalBackdrop = requireElement<HTMLDivElement>(app, '#modelToolsModalBackdrop')
-const openLibraryButton = requireElement<HTMLButtonElement>(app, '#openLibraryButton')
-const libraryModal = requireElement<HTMLDivElement>(app, '#libraryModal')
-const closeLibraryButton = requireElement<HTMLButtonElement>(app, '#closeLibraryButton')
-const libraryModalBackdrop = requireElement<HTMLDivElement>(app, '#libraryModalBackdrop')
+const assetsModal = requireElement<HTMLDivElement>(app, '#assetsModal')
+const assetsModalBackdrop = requireElement<HTMLDivElement>(app, '#assetsModalBackdrop')
+const closeAssetsButton = requireElement<HTMLButtonElement>(app, '#closeAssetsButton')
 const libraryUploadButton = requireElement<HTMLButtonElement>(app, '#libraryUploadButton')
 const libraryInput = requireElement<HTMLInputElement>(app, '#libraryInput')
 const libraryGrid = requireElement<HTMLDivElement>(app, '#libraryGrid')
 const libraryHint = requireElement<HTMLParagraphElement>(app, '#libraryHint')
 const addGraphicButton = requireElement<HTMLButtonElement>(app, '#addGraphicButton')
 const imageInput = requireElement<HTMLInputElement>(app, '#imageInput')
-const baseImageInput = requireElement<HTMLInputElement>(app, '#baseImageInput')
-const changeBaseButton = requireElement<HTMLButtonElement>(app, '#changeBaseButton')
 const layersSectionTitle = requireElement<HTMLHeadingElement>(app, '#layersSectionTitle')
 const variantSelect = requireElement<HTMLSelectElement>(app, '#variantSelect')
 const variantNewButton = requireElement<HTMLButtonElement>(app, '#variantNewButton')
@@ -2325,6 +2622,8 @@ const exportPngButton = requireElement<HTMLButtonElement>(app, '#exportPngButton
 const canvasStage = requireElement<HTMLDivElement>(app, '#canvasStage')
 const canvasPanel = requireElement<HTMLElement>(app, '.canvas-panel')
 const layersSection = requireElement<HTMLElement>(app, '#layersSection')
+const cardVariantControls = requireElement<HTMLDivElement>(app, '#cardVariantControls')
+const variantBar = requireElement<HTMLDivElement>(app, '#variantBar')
 const editItemLabel = requireElement<HTMLParagraphElement>(app, '#editItemLabel')
 const editPanelContent = requireElement<HTMLDivElement>(app, '#editPanelContent')
 const cardsSection = requireElement<HTMLElement>(app, '#cardsSection')
@@ -2342,6 +2641,7 @@ const themeLabel = requireElement<HTMLSpanElement>(app, '#themeLabel')
 const themeIcon = requireElement<HTMLSpanElement>(app, '#themeIcon')
 const editorLayout = requireElement<HTMLElement>(app, '.editor-layout')
 const leftPanelResizer = requireElement<HTMLDivElement>(app, '#leftPanelResizer')
+const deckPanelResizer = requireElement<HTMLDivElement>(app, '#deckPanelResizer')
 const rightPanelResizer = requireElement<HTMLDivElement>(app, '#rightPanelResizer')
 const openTemplatesButton = requireElement<HTMLButtonElement>(app, '#openTemplatesButton')
 const templatesModal = requireElement<HTMLDivElement>(app, '#templatesModal')
@@ -2354,6 +2654,10 @@ const tutorialSection = requireElement<HTMLElement>(app, '#tutorialSection')
 const backToEditorButton = requireElement<HTMLButtonElement>(app, '#backToEditorButton')
 
 const PANEL_WIDTHS_STORAGE_KEY = 'deckstudio.panel-widths-v2'
+const DECK_PREVIEW_HIDDEN_STORAGE_KEY = 'deckstudio.deck-preview-hidden-v1'
+const DECK_PREVIEW_MIN_WIDTH = 220
+const DECK_PREVIEW_MAX_WIDTH = 460
+let deckPreviewHidden = localStorage.getItem(DECK_PREVIEW_HIDDEN_STORAGE_KEY) === 'true'
 
 function preferredScrollBehavior(): ScrollBehavior {
   return window.matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth'
@@ -2377,35 +2681,50 @@ backToEditorButton.addEventListener('click', () => {
 
 window.addEventListener('scroll', syncBackToEditorButton, { passive: true })
 
-function setPanelWidths(left: number, right: number): void {
+function setPanelWidths(left: number, deck: number, right: number): void {
   editorLayout.style.setProperty('--left-panel-width', `${left}px`)
+  editorLayout.style.setProperty('--deck-panel-width', `${deck}px`)
   editorLayout.style.setProperty('--right-panel-width', `${right}px`)
 }
 
-function currentPanelWidths(): { left: number; right: number } {
+function currentPanelWidths(): { left: number; deck: number; right: number } {
   const styles = getComputedStyle(editorLayout)
   return {
     left: Number.parseFloat(styles.getPropertyValue('--left-panel-width')) || 320,
+    deck: Number.parseFloat(styles.getPropertyValue('--deck-panel-width')) || 300,
     right: Number.parseFloat(styles.getPropertyValue('--right-panel-width')) || 360,
   }
 }
 
 try {
-  const saved = JSON.parse(localStorage.getItem(PANEL_WIDTHS_STORAGE_KEY) ?? '{}') as { left?: number; right?: number }
-  if (Number.isFinite(saved.left) && Number.isFinite(saved.right)) setPanelWidths(saved.left!, saved.right!)
+  const saved = JSON.parse(localStorage.getItem(PANEL_WIDTHS_STORAGE_KEY) ?? '{}') as { left?: number; deck?: number; right?: number }
+  if (Number.isFinite(saved.left) && Number.isFinite(saved.right)) {
+    setPanelWidths(
+      saved.left!,
+      Number.isFinite(saved.deck) ? clamp(DECK_PREVIEW_MIN_WIDTH, DECK_PREVIEW_MAX_WIDTH, saved.deck!) : 300,
+      saved.right!,
+    )
+  }
 } catch {
   // Ignora preferências antigas ou inválidas.
 }
 
-function attachPanelResizer(handle: HTMLElement, side: 'left' | 'right'): void {
+function attachPanelResizer(handle: HTMLElement, side: 'left' | 'deck' | 'right'): void {
   const resizeBy = (delta: number): void => {
     const widths = currentPanelWidths()
     const available = editorLayout.clientWidth
-    const maxLeft = Math.min(420, available - widths.right - 420)
-    const maxRight = Math.min(520, available - widths.left - 420)
+    const showDeck = !deckPreviewHidden && activeEditMode === 'deck'
+    const deckWidth = showDeck ? widths.deck : 0
+    const fixedTracks = widths.left + deckWidth + widths.right + 24 + 36 + 320
+    const maxLeft = Math.min(420, available - (fixedTracks - widths.left))
+    const maxDeck = Math.min(DECK_PREVIEW_MAX_WIDTH, available - (fixedTracks - deckWidth))
+    const maxRight = Math.min(520, available - (fixedTracks - widths.right))
     const left = side === 'left' ? clamp(180, Math.max(180, maxLeft), widths.left + delta) : widths.left
+    const deck = side === 'deck'
+      ? clamp(DECK_PREVIEW_MIN_WIDTH, Math.max(DECK_PREVIEW_MIN_WIDTH, maxDeck), widths.deck - delta)
+      : widths.deck
     const right = side === 'right' ? clamp(280, Math.max(280, maxRight), widths.right - delta) : widths.right
-    setPanelWidths(left, right)
+    setPanelWidths(left, deck, right)
     fitCanvasZoomToStage()
   }
 
@@ -2416,7 +2735,7 @@ function attachPanelResizer(handle: HTMLElement, side: 'left' | 'right'): void {
     document.body.classList.add('is-resizing-panels')
 
     const move = (moveEvent: PointerEvent): void => {
-      setPanelWidths(start.left, start.right)
+      setPanelWidths(start.left, start.deck, start.right)
       resizeBy(moveEvent.clientX - startX)
     }
     const stop = (): void => {
@@ -2432,13 +2751,26 @@ function attachPanelResizer(handle: HTMLElement, side: 'left' | 'right'): void {
   handle.addEventListener('keydown', (event) => {
     if (event.key !== 'ArrowLeft' && event.key !== 'ArrowRight') return
     event.preventDefault()
-    resizeBy(event.key === 'ArrowRight' ? 12 : -12)
+    const direction = event.key === 'ArrowRight' ? 12 : -12
+    resizeBy(side === 'right' || side === 'deck' ? -direction : direction)
     localStorage.setItem(PANEL_WIDTHS_STORAGE_KEY, JSON.stringify(currentPanelWidths()))
   })
 }
 
 attachPanelResizer(leftPanelResizer, 'left')
+attachPanelResizer(deckPanelResizer, 'deck')
 attachPanelResizer(rightPanelResizer, 'right')
+
+function syncDeckPreviewVisibility(): void {
+  const hidden = deckPreviewHidden || activeEditMode !== 'deck'
+  cardsSection.hidden = hidden
+  cardsSection.classList.toggle('tab-panel-hidden', hidden)
+  editorLayout.classList.toggle('is-deck-preview-hidden', hidden)
+  editDeckButton.classList.toggle('is-active', !hidden)
+  editDeckButton.title = hidden ? 'Mostrar coluna Baralho' : 'Ocultar coluna Baralho'
+  editDeckButton.setAttribute('aria-label', editDeckButton.title)
+  editDeckButton.setAttribute('aria-checked', String(!hidden))
+}
 
 function syncThemeSwitch(theme: ColorTheme): void {
   const isDark = theme === 'dark'
@@ -2473,12 +2805,14 @@ const canvas = new Canvas('cardCanvas', {
   preserveObjectStacking: true,
   selection: true,
 })
-const syncEmptyFrame = (): void => {
-  canvasStage.classList.toggle('is-empty', canvas.getObjects().length === 0)
+const syncCanvasFrame = (): void => {
+  const hasContent = canvas.getObjects().length > 0
+  canvasStage.classList.toggle('is-empty', !hasContent)
+  canvasStage.classList.toggle('has-content', hasContent)
 }
-canvas.on('object:added', syncEmptyFrame)
-canvas.on('object:removed', syncEmptyFrame)
-syncEmptyFrame()
+canvas.on('object:added', syncCanvasFrame)
+canvas.on('object:removed', syncCanvasFrame)
+syncCanvasFrame()
 const thumbnailCanvasElement = document.createElement('canvas')
 thumbnailCanvasElement.width = CARD_WIDTH
 thumbnailCanvasElement.height = CARD_HEIGHT
@@ -2489,7 +2823,6 @@ const thumbnailCanvas = new Canvas(thumbnailCanvasElement, {
 })
 
 const layerById = new Map<string, FabricObject>()
-let baseLayerId = ''
 let layerCount = 0
 let suppressSelectionSync = false
 let draggedLayerId: string | null = null
@@ -2520,21 +2853,22 @@ function renderWorkspaceTabs(): void {
 
   editModelButton.classList.toggle('is-active', modelActive)
   editBackButton.classList.toggle('is-active', backActive)
-  editDeckButton.classList.toggle('is-active', activeEditMode === 'deck')
-
-  const showLayers = templateActive
   const showCards = activeEditMode === 'deck'
+  const showLayers = templateActive || showCards
 
   layersSection.hidden = !showLayers
-  cardsSection.hidden = !showCards
   layersSection.classList.toggle('tab-panel-hidden', !showLayers)
-  cardsSection.classList.toggle('tab-panel-hidden', !showCards)
-  openModelToolsButton.hidden = !templateActive
+  cardsSection.classList.toggle('tab-panel-hidden', !showCards || deckPreviewHidden)
+  syncDeckPreviewVisibility()
+  cardVariantControls.hidden = !showCards
+  variantBar.hidden = showCards
+  layersSectionTitle.textContent = showCards
+    ? `Layers · ${currentDeck().cards.find(card => card.id === currentDeck().activeCardId)?.name ?? 'Carta'}`
+    : activeEditMode === 'back' ? 'Verso' : 'Modelo'
   libraryLauncher.classList.toggle('library-only', !templateActive)
-  if (!templateActive) modelToolsModal.hidden = true
 
   if (showLayers) {
-    renderVariantBar()
+    if (templateActive) renderVariantBar()
     renderLayersAccordion()
   } else {
     layersAccordion.innerHTML = ''
@@ -2576,7 +2910,7 @@ function renderEditorPanel(): void {
   editPanelContent.innerHTML = ''
   const body = document.createElement('div')
   body.className = 'layer-body'
-  const editable = meta.kind !== 'base' && meta.scope === activeEditMode
+  const editable = meta.scope === activeEditMode
   buildLayerBody(selected, meta, editable, body)
   if (editable) {
     body.prepend(createArrangeControls())
@@ -2723,7 +3057,7 @@ function createArrangeControls(): HTMLElement {
 
   const targets = (): FabricObject[] => canvas.getActiveObjects().filter((object) => {
     const meta = getLayerMeta(object)
-    return meta.kind !== 'base' && meta.scope === activeEditMode
+    return meta.scope === activeEditMode && !meta.locked && !meta.isBackground
   })
 
   // Opera em coordenadas absolutas: desfaz a seleção múltipla, aplica e restaura.
@@ -2860,15 +3194,9 @@ function createArrangeControls(): HTMLElement {
 }
 
 function syncModeControls(): void {
-  const modelActive = activeEditMode !== 'deck'
-  addGraphicButton.disabled = !modelActive
-  addTextButton.disabled = !modelActive
-  shapePalette.querySelectorAll('button').forEach((button) => { button.disabled = !modelActive })
-  changeBaseButton.disabled = !modelActive
-
-  addGraphicButton.title = modelActive ? '' : 'No modo Baralho, edite apenas os layers existentes.'
-  addTextButton.title = modelActive ? '' : 'No modo Baralho, edite apenas os textos existentes.'
-  changeBaseButton.title = modelActive ? '' : 'O fundo so pode ser alterado no modo Modelo.'
+  addGraphicButton.disabled = false
+  addTextButton.disabled = false
+  shapePalette.querySelectorAll('button').forEach((button) => { button.disabled = false })
 }
 
 function destroySelectedTextEditor(): void {
@@ -2891,9 +3219,7 @@ function selectedDeckEditableObject(): FabricObject | null {
   }
 
   const meta = getLayerMeta(object)
-  const canEdit = (meta.scope === 'model' && (meta.kind === 'text' || meta.kind === 'image'))
-    || (meta.scope === 'deck' && meta.kind === 'graphic')
-  return canEdit ? object : null
+  return meta.scope === 'deck' ? object : null
 }
 
 function renderEditEmptyMessage(message: string): void {
@@ -2920,12 +3246,47 @@ function createEditorToolbarButton(label: string, onClick: () => void): HTMLButt
   return button
 }
 
-function renderSelectedTextEditor(textObject: FabricText | Textbox): void {
+function textObjectToEditorHtml(textObject: FabricText | Textbox): string {
   const meta = getLayerMeta(textObject)
+  if (meta.richTextFormat === 'html' && meta.richTextSource) return meta.richTextSource
+
+  const styles = (textObject as unknown as { styles?: Record<number, Record<number, Record<string, unknown>>> }).styles ?? {}
+  const text = String((textObject as { text?: unknown }).text ?? '')
+  const escape = (value: string): string => value
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+  const lines = text.split('\n').map((line, lineIndex) => Array.from(line).map((character, charIndex) => {
+    const style = styles[lineIndex]?.[charIndex] ?? {}
+    const css = [
+      typeof style['fill'] === 'string' ? `color:${style['fill']}` : '',
+      typeof style['fontFamily'] === 'string' ? `font-family:${style['fontFamily']}` : '',
+      typeof style['fontSize'] === 'number' ? `font-size:${style['fontSize']}px` : '',
+      typeof style['fontWeight'] === 'string' ? `font-weight:${style['fontWeight']}` : '',
+      typeof style['fontStyle'] === 'string' ? `font-style:${style['fontStyle']}` : '',
+      typeof style['textBackgroundColor'] === 'string' ? `background-color:${style['textBackgroundColor']}` : '',
+      typeof style['textBackgroundRadius'] === 'number' ? `border-radius:${style['textBackgroundRadius']}px` : '',
+      typeof style['textBackgroundPaddingX'] === 'number' || typeof style['textBackgroundPaddingY'] === 'number'
+        ? `padding:${Number(style['textBackgroundPaddingY']) || 0}px ${Number(style['textBackgroundPaddingX']) || 0}px`
+        : '',
+      style['underline'] ? 'text-decoration:underline' : '',
+    ].filter(Boolean).join(';')
+    const content = escape(character)
+    return css ? `<span style="${escape(css)}">${content}</span>` : content
+  }).join('')).join('<br>')
+  return lines || '<p></p>'
+}
+
+function renderRichTextEditor(
+  container: HTMLElement,
+  textObject: FabricText | Textbox,
+  commit: () => void,
+): void {
   const title = document.createElement('p')
   title.className = 'layer-note'
-  title.textContent = 'Editor de texto da carta (individual).'
-  editPanelContent.append(title)
+  title.textContent = 'Editor de texto'
+  container.append(title)
 
   const toolbar = document.createElement('div')
   toolbar.className = 'rich-toolbar'
@@ -2934,6 +3295,17 @@ function renderSelectedTextEditor(textObject: FabricText | Textbox): void {
   colorInput.type = 'color'
   colorInput.value = '#2f9e44'
   attachNoDragPropagation(colorInput)
+
+  const selectedFontFamily = createFontSelect(String((textObject as { fontFamily?: unknown }).fontFamily ?? 'Arial'))
+  attachNoDragPropagation(selectedFontFamily)
+  const selectedFontSize = document.createElement('input')
+  selectedFontSize.type = 'number'
+  selectedFontSize.min = '8'
+  selectedFontSize.max = '220'
+  selectedFontSize.step = '1'
+  selectedFontSize.value = String((textObject as { fontSize?: unknown }).fontSize ?? 40)
+  selectedFontSize.title = 'Tamanho para o trecho selecionado'
+  attachNoDragPropagation(selectedFontSize)
 
   const applyColorButton = createEditorToolbarButton('Cor', () => {
     selectedTextEditor?.chain().focus().setColor(colorInput.value).run()
@@ -2953,10 +3325,29 @@ function renderSelectedTextEditor(textObject: FabricText | Textbox): void {
   const clearMarksButton = createEditorToolbarButton('Limpar estilo', () => {
     selectedTextEditor?.chain().focus().unsetAllMarks().run()
   })
+  const applySelectedFontButton = createEditorToolbarButton('Aplicar fonte', () => {
+    selectedTextEditor?.chain().focus().setMark('textStyle', { fontFamily: selectedFontFamily.value }).run()
+  })
+  const applySelectedSizeButton = createEditorToolbarButton('Aplicar tamanho', () => {
+    const fontSize = clamp(8, 220, Number(selectedFontSize.value) || 40)
+    selectedTextEditor?.chain().focus().setMark('textStyle', { fontSize: `${fontSize}px` }).run()
+  })
 
-  toolbar.append(boldButton, italicButton, underlineButton, colorInput, applyColorButton, clearColorButton, clearMarksButton)
-  editPanelContent.append(toolbar)
-  editPanelContent.append(detailsRow('Meus 5 estilos', createSavedTextColorPalette((style) => {
+  toolbar.append(
+    boldButton,
+    italicButton,
+    underlineButton,
+    colorInput,
+    applyColorButton,
+    selectedFontFamily,
+    applySelectedFontButton,
+    selectedFontSize,
+    applySelectedSizeButton,
+    clearColorButton,
+    clearMarksButton,
+  )
+  container.append(toolbar)
+  container.append(detailsRow('Meus 5 estilos', createSavedTextColorPalette((style) => {
     selectedTextEditor?.chain().focus().setMark('textStyle', {
       color: style.color,
       backgroundColor: style.backgroundColor,
@@ -2968,17 +3359,9 @@ function renderSelectedTextEditor(textObject: FabricText | Textbox): void {
 
   const editorElement = document.createElement('div')
   editorElement.className = 'rich-editor-surface'
-  editPanelContent.append(editorElement)
+  container.append(editorElement)
 
   destroySelectedTextEditor()
-
-  const initialHtml = meta.richTextFormat === 'html' && meta.richTextSource
-    ? meta.richTextSource
-    : String((textObject as { text?: unknown }).text ?? '')
-      .replace(/&/g, '&amp;')
-      .replace(/</g, '&lt;')
-      .replace(/>/g, '&gt;')
-      .replace(/\n/g, '<br>')
 
   selectedTextEditor = new Editor({
     element: editorElement,
@@ -2990,19 +3373,53 @@ function renderSelectedTextEditor(textObject: FabricText | Textbox): void {
         codeBlock: false,
         heading: false,
         horizontalRule: false,
+        underline: false,
       }),
       StyledTextStyle,
       Color,
       Underline,
     ],
-    content: initialHtml,
+    content: textObjectToEditorHtml(textObject),
     onUpdate: ({ editor }) => {
       const html = editor.getHTML()
       applyRichTextToObject(textObject, html, 'html')
       textObject.setCoords()
-      commitDeckContentChanges()
+      commit()
     },
   })
+}
+
+function removeLegacyTaggedTextControls(container: HTMLElement): void {
+  container.querySelectorAll('textarea').forEach((field) => field.closest('.layer-detail-row')?.remove())
+  container.querySelectorAll('.text-color-palette, .inline-color-controls').forEach((control) => {
+    control.closest('.layer-detail-row')?.remove()
+  })
+
+  const legacyLabels = new Set([
+    'Formato da tag de cor',
+    'Paleta rápida',
+    'Tag com cor personalizada',
+    'Aplicar cor custom',
+    'Cores rápidas',
+    'Cor personalizada',
+  ])
+  container.querySelectorAll<HTMLDivElement>('.layer-detail-row').forEach((row) => {
+    const label = row.querySelector('label')
+    const labelText = Array.from(label?.childNodes ?? [])
+      .filter((node) => node.nodeType === Node.TEXT_NODE)
+      .map((node) => node.textContent?.trim() ?? '')
+      .join(' ')
+      .trim()
+    if (legacyLabels.has(labelText)) row.remove()
+  })
+
+  const savedStyleRows = Array.from(container.querySelectorAll<HTMLDivElement>('.layer-detail-row'))
+    .filter((row) => row.querySelector('.saved-color-palette'))
+  savedStyleRows.slice(1).forEach((row) => row.remove())
+}
+
+function renderSelectedTextEditor(textObject: FabricText | Textbox): void {
+  renderRichTextEditor(editPanelContent, textObject, commitDeckContentChanges)
 
   const fontFamilyField = createFontSelect(String((textObject as { fontFamily?: unknown }).fontFamily ?? 'Arial'))
   attachNoDragPropagation(fontFamilyField)
@@ -3010,7 +3427,7 @@ function renderSelectedTextEditor(textObject: FabricText | Textbox): void {
     textObject.set({ fontFamily: fontFamilyField.value })
     commitDeckContentChanges()
   })
-  editPanelContent.append(detailsRow('Fonte', fontFamilyField))
+  editPanelContent.append(detailsRow('Fonte base', fontFamilyField))
 
   const fontSizeField = document.createElement('input')
   fontSizeField.type = 'number'
@@ -3023,26 +3440,13 @@ function renderSelectedTextEditor(textObject: FabricText | Textbox): void {
     textObject.set({ fontSize: clamp(8, 220, Number(fontSizeField.value) || 40) })
     commitDeckContentChanges()
   })
-  editPanelContent.append(detailsRow('Tamanho', fontSizeField))
-
-  const alignField = document.createElement('select')
-  attachNoDragPropagation(alignField)
-  ;(['left', 'center', 'right', 'justify'] as TextAlignMode[]).forEach((align) => {
-    const option = document.createElement('option')
-    option.value = align
-    option.textContent = align
-    option.selected = normalizeTextAlign((textObject as { textAlign?: unknown }).textAlign, 'left') === align
-    alignField.append(option)
-  })
-  alignField.addEventListener('change', () => {
-    textObject.set({ textAlign: alignField.value as TextAlignMode })
-    commitDeckContentChanges()
-  })
-  editPanelContent.append(detailsRow('Alinhamento', alignField))
+  editPanelContent.append(detailsRow('Tamanho base', fontSizeField))
+  editPanelContent.append(createTextLayoutControls(textObject, commitDeckContentChanges))
 }
 
 function createGraphicSizeControls(graphic: FabricObject): DocumentFragment {
   const fragment = document.createDocumentFragment()
+  const meta = getLayerMeta(graphic)
   const field = (label: string, current: number, apply: (value: number) => void): void => {
     const input = document.createElement('input')
     input.type = 'number'
@@ -3064,6 +3468,7 @@ function createGraphicSizeControls(graphic: FabricObject): DocumentFragment {
   const naturalHeight = Math.max(1, graphic.height ?? 1)
   field('Largura', naturalWidth * (graphic.scaleX ?? 1), (v) => graphic.set({ scaleX: v / naturalWidth }))
   field('Altura', naturalHeight * (graphic.scaleY ?? 1), (v) => graphic.set({ scaleY: v / naturalHeight }))
+  fragment.querySelectorAll('input').forEach((input) => { input.disabled = Boolean(meta.locked || meta.isBackground) })
   return fragment
 }
 
@@ -3225,7 +3630,7 @@ function renderSelectedItemEditor(): void {
   }
 
   const meta = getLayerMeta(selected)
-  editItemLabel.textContent = `${meta.name} • ${meta.kind === 'text' ? 'Texto' : meta.kind === 'graphic' ? 'Gráfico' : 'Imagem'}`
+  editItemLabel.textContent = `${meta.name} • ${layerKindLabel(meta.kind)}`
 
   if (meta.kind === 'graphic') {
     destroySelectedTextEditor()
@@ -3244,7 +3649,13 @@ function renderSelectedItemEditor(): void {
     return
   }
 
-  renderEditEmptyMessage('Este item não possui controles de edição nesta visualização.')
+  destroySelectedTextEditor()
+  editPanelContent.innerHTML = ''
+  const body = document.createElement('div')
+  body.className = 'layer-body'
+  buildLayerBody(selected, meta, true, body)
+  body.prepend(createArrangeControls())
+  editPanelContent.append(body)
 }
 
 function renderCardThumbnails(): void {
@@ -3318,27 +3729,112 @@ function renderCardThumbnails(): void {
     const duplicateBtn = document.createElement('button')
     duplicateBtn.type = 'button'
     duplicateBtn.className = 'tiny ghost card-thumb-duplicate'
-    duplicateBtn.textContent = 'Duplicar'
+    duplicateBtn.innerHTML = '<span class="material-symbols-outlined" aria-hidden="true">content_copy</span>'
     duplicateBtn.setAttribute('aria-label', `Duplicar ${card.name}`)
+    duplicateBtn.title = `Duplicar ${card.name}`
+    duplicateBtn.dataset.tooltip = `Duplicar ${card.name}`
     duplicateBtn.addEventListener('click', () => {
       duplicateCard(card.id)
+    })
+
+    const renameBtn = document.createElement('button')
+    renameBtn.type = 'button'
+    renameBtn.className = 'tiny ghost card-thumb-rename'
+    renameBtn.innerHTML = '<span class="material-symbols-outlined" aria-hidden="true">edit</span>'
+    renameBtn.setAttribute('aria-label', `Renomear ${card.name}`)
+    renameBtn.title = `Renomear ${card.name}`
+    renameBtn.dataset.tooltip = `Renomear ${card.name}`
+    renameBtn.addEventListener('click', () => {
+      beginCardRename(card.id, item, meta)
     })
 
     const deleteBtn = document.createElement('button')
     deleteBtn.type = 'button'
     deleteBtn.className = 'tiny danger card-thumb-delete'
-    deleteBtn.textContent = 'Excluir'
+    deleteBtn.innerHTML = '<span class="material-symbols-outlined" aria-hidden="true">delete</span>'
+    deleteBtn.setAttribute('aria-label', `Excluir ${card.name}`)
+    deleteBtn.title = deck.cards.length <= 1 ? 'O baralho precisa ter ao menos 1 carta.' : `Excluir ${card.name}`
+    deleteBtn.dataset.tooltip = deleteBtn.title
     deleteBtn.disabled = deck.cards.length <= 1
     deleteBtn.addEventListener('click', () => {
       deleteCard(card.id)
     })
 
-    actions.append(duplicateBtn, deleteBtn)
+    actions.append(renameBtn, duplicateBtn, deleteBtn)
     item.append(pair, meta, actions)
     cardThumbnails.append(item)
   })
 
   cardThumbnails.scrollTop = previousScrollTop
+}
+
+function splitCardName(name: string): { base: string; number: number } {
+  const trimmed = name.trim()
+  const match = /^(.*?)(?:\s+(\d+))?$/.exec(trimmed)
+  const base = match?.[1]?.trim() || 'Carta'
+  const number = Math.max(1, Number(match?.[2] ?? 1) || 1)
+  return { base, number }
+}
+
+function normalizeCardName(name: string): string {
+  const { base, number } = splitCardName(name)
+  return `${base} ${number}`
+}
+
+function nextCardName(deck: DeckDocument, nameBase: string, excludingCardId?: string): string {
+  const normalizedBase = nameBase.trim().toLocaleLowerCase()
+  const usedNumbers = deck.cards
+    .filter(card => card.id !== excludingCardId)
+    .map(card => splitCardName(card.name))
+    .filter(parts => parts.base.toLocaleLowerCase() === normalizedBase)
+    .map(parts => parts.number)
+  return `${nameBase.trim() || 'Carta'} ${Math.max(0, ...usedNumbers) + 1}`
+}
+
+function beginCardRename(cardId: string, item: HTMLElement, meta: HTMLElement): void {
+  const card = currentDeck().cards.find(candidate => candidate.id === cardId)
+  if (!card) return
+
+  const nameInput = document.createElement('input')
+  nameInput.type = 'text'
+  nameInput.className = 'card-thumb-rename-input'
+  nameInput.value = card.name
+  nameInput.maxLength = 80
+  nameInput.setAttribute('aria-label', `Nome da carta ${card.name}`)
+  nameInput.addEventListener('click', event => event.stopPropagation())
+
+  let finished = false
+  const finish = (cancel = false): void => {
+    if (finished) return
+    finished = true
+    if (!cancel) renameCard(cardId, nameInput.value)
+    else nameInput.remove()
+  }
+  nameInput.addEventListener('keydown', (event) => {
+    if (event.key === 'Enter') {
+      event.preventDefault()
+      finish()
+    } else if (event.key === 'Escape') {
+      event.preventDefault()
+      finish(true)
+    }
+  })
+  nameInput.addEventListener('blur', () => finish())
+
+  item.insertBefore(nameInput, meta)
+  nameInput.focus()
+  nameInput.select()
+}
+
+function renameCard(cardId: string, requestedName: string): void {
+  const deck = currentDeck()
+  const card = deck.cards.find(item => item.id === cardId)
+  if (!card) return
+
+  const { base, number } = splitCardName(requestedName)
+  const nextNumber = Math.max(number, Number(nextCardName(deck, base, cardId).split(' ').at(-1)))
+  card.name = `${base} ${nextNumber}`
+  renderCardThumbnails()
 }
 
 function deleteCard(cardId: string): void {
@@ -3373,9 +3869,11 @@ function duplicateCard(cardId: string): void {
   if (sourceIndex < 0) return
 
   const sourceCard = deck.cards[sourceIndex]
+  const sourceName = splitCardName(sourceCard.name)
   const duplicatedCard: CardState = {
     id: generateDeckId(),
-    name: `${sourceCard.name} - cópia`,
+    name: nextCardName(deck, sourceName.base),
+    canvas: cloneCanvasState(sourceCard.canvas ?? createEmptyCanvasState()),
     deckObjects: deepClone(sourceCard.deckObjects),
     modelId: sourceCard.modelId,
     backId: sourceCard.backId,
@@ -3429,15 +3927,27 @@ async function loadDeckCanvas(state: ReturnType<Canvas['toObject']>): Promise<vo
   return withLoading(async () => {
     canvas.clear()
     layerById.clear()
-    baseLayerId = ''
-
     await canvas.loadFromJSON(state)
+    syncCanvasFrame()
 
     const objects = canvas.getObjects()
     objects.forEach((object) => {
       const meta = getLayerMeta(object)
       if (meta.kind === 'base') {
-        baseLayerId = meta.id
+        setLayerMeta(object, { ...meta, kind: 'image', isBackground: true })
+        if (object instanceof FabricImage) {
+          const imageWidth = object.width ?? CARD_WIDTH
+          const imageHeight = object.height ?? CARD_HEIGHT
+          object.set({
+            left: 0,
+            top: 0,
+            originX: 'left',
+            originY: 'top',
+            scaleX: CARD_WIDTH / imageWidth,
+            scaleY: CARD_HEIGHT / imageHeight,
+          })
+          object.setCoords()
+        }
       }
 
       const currentScope = normalizeScope((object.get('data') as Partial<LayerMeta> | undefined)?.scope, meta.kind)
@@ -3505,12 +4015,19 @@ function getLayerMeta(object: FabricObject): LayerMeta {
     cropPositionY: typeof raw?.cropPositionY === 'number' ? clamp(0, 1, raw.cropPositionY) : 0.5,
     richTextSource: typeof raw?.richTextSource === 'string' ? raw.richTextSource : undefined,
     richTextFormat: raw?.richTextFormat === 'html' ? 'html' : 'tags',
+    textVerticalAlign: normalizeTextVerticalAlign(raw?.textVerticalAlign),
+    textOverflow: normalizeTextOverflow(raw?.textOverflow),
+    textBoxHeight: typeof raw?.textBoxHeight === 'number' && raw.textBoxHeight > 0
+      ? raw.textBoxHeight
+      : isTextLayer(object) ? Math.max(1, object.height ?? 1) : undefined,
     graphicSource: typeof raw?.graphicSource === 'string' ? raw.graphicSource : undefined,
     scaleMode: raw?.scaleMode === 'nine-slice' ? 'nine-slice' : 'stretch',
     insetTop: Math.max(0, Number(raw?.insetTop) || 0),
     insetRight: Math.max(0, Number(raw?.insetRight) || 0),
     insetBottom: Math.max(0, Number(raw?.insetBottom) || 0),
     insetLeft: Math.max(0, Number(raw?.insetLeft) || 0),
+    locked: raw?.locked === true,
+    isBackground: raw?.isBackground === true || raw?.kind === 'base',
   }
   setLayerMeta(object, meta)
   return meta
@@ -3632,6 +4149,9 @@ function layerKindLabel(kind: LayerKind): string {
 
 function applyRuntimeConfig(object: FabricObject): void {
   const meta = getLayerMeta(object)
+  if (isTextLayer(object) && object.textAlign === 'justify') {
+    object.set({ textAlign: 'left' })
+  }
   const canEditCardModelContent =
     activeEditMode === 'deck' && meta.scope === 'model' && (meta.kind === 'text' || meta.kind === 'image')
 
@@ -3643,19 +4163,20 @@ function applyRuntimeConfig(object: FabricObject): void {
     padding: 4,
   })
 
-  const fullyEditable = meta.kind !== 'base' && meta.scope === activeEditMode
-  const contentOnlyEditable = meta.kind !== 'base' && !fullyEditable && canEditCardModelContent
+  const fullyEditable = meta.scope === activeEditMode
+  const contentOnlyEditable = !fullyEditable && canEditCardModelContent
   const selectable = fullyEditable || contentOnlyEditable
+  const positionLocked = meta.locked || meta.isBackground
 
   object.set({
     selectable,
     evented: selectable,
-    lockMovementX: !fullyEditable,
-    lockMovementY: !fullyEditable,
-    lockRotation: !fullyEditable,
-    lockScalingX: !fullyEditable,
-    lockScalingY: !fullyEditable,
-    hasControls: fullyEditable,
+    lockMovementX: !fullyEditable || positionLocked,
+    lockMovementY: !fullyEditable || positionLocked,
+    lockRotation: !fullyEditable || positionLocked,
+    lockScalingX: !fullyEditable || positionLocked,
+    lockScalingY: !fullyEditable || positionLocked,
+    hasControls: fullyEditable && !positionLocked,
     editable: meta.kind === 'text' && selectable,
   })
 }
@@ -3683,7 +4204,7 @@ function selectLayer(layerId: string): void {
   }
 
   const meta = getLayerMeta(object)
-  if (meta.kind !== 'base' && meta.scope !== activeEditMode) {
+  if (meta.scope !== activeEditMode) {
     return
   }
 
@@ -3695,9 +4216,6 @@ function selectLayer(layerId: string): void {
 }
 
 function removeLayer(layerId: string): void {
-  if (layerId === baseLayerId) {
-    return
-  }
   const object = layerById.get(layerId)
   if (!object) {
     return
@@ -3709,6 +4227,7 @@ function removeLayer(layerId: string): void {
 
   canvas.remove(object)
   refreshLayerIndex()
+  persistActiveDeckDocument()
   renderLayersAccordion()
   canvas.requestRenderAll()
 }
@@ -3720,7 +4239,7 @@ function moveLayer(layerId: string, direction: 'up' | 'down'): void {
   }
 
   const meta = getLayerMeta(object)
-  if (meta.kind === 'base' || meta.scope !== activeEditMode) {
+  if (meta.scope !== activeEditMode) {
     return
   }
 
@@ -3739,6 +4258,7 @@ function moveLayer(layerId: string, direction: 'up' | 'down'): void {
 
   canvas.moveObjectTo(object, nextIndex)
   refreshLayerIndex()
+  persistActiveDeckDocument()
   renderLayersAccordion()
   canvas.requestRenderAll()
 }
@@ -3759,7 +4279,7 @@ function reorderLayersByAccordion(sourceLayerId: string, targetLayerId: string):
 
   const sourceMeta = getLayerMeta(ordered[fromIndex])
   const targetMeta = getLayerMeta(ordered[toIndex])
-  if (sourceMeta.kind === 'base' || sourceMeta.scope !== activeEditMode || targetMeta.scope !== activeEditMode) {
+  if (sourceMeta.scope !== activeEditMode || targetMeta.scope !== activeEditMode) {
     return
   }
 
@@ -3773,6 +4293,45 @@ function reorderLayersByAccordion(sourceLayerId: string, targetLayerId: string):
   })
 
   refreshLayerIndex()
+  persistActiveDeckDocument()
+  renderLayersAccordion()
+  canvas.requestRenderAll()
+}
+
+function setLayerLocked(layerId: string, locked: boolean): void {
+  const object = layerById.get(layerId)
+  if (!object) return
+  const meta = getLayerMeta(object)
+  setLayerMeta(object, { ...meta, locked })
+  applyRuntimeConfig(object)
+  persistActiveDeckDocument()
+  renderLayersAccordion()
+  canvas.requestRenderAll()
+}
+
+function setLayerBackground(layerId: string, enabled: boolean): void {
+  const object = layerById.get(layerId)
+  if (!object) return
+  const meta = getLayerMeta(object)
+  const nextMeta = {
+    ...meta,
+    isBackground: enabled,
+    ...(enabled && object instanceof FabricImage ? { fit: 'fill' as const, slotWidth: CARD_WIDTH, slotHeight: CARD_HEIGHT } : {}),
+  }
+  setLayerMeta(object, nextMeta)
+  if (enabled) {
+    object.set({
+      left: 0,
+      top: 0,
+      originX: 'left',
+      originY: 'top',
+      scaleX: CARD_WIDTH / Math.max(1, object.width ?? 1),
+      scaleY: CARD_HEIGHT / Math.max(1, object.height ?? 1),
+    })
+  }
+  applyRuntimeConfig(object)
+  object.setCoords()
+  persistActiveDeckDocument()
   renderLayersAccordion()
   canvas.requestRenderAll()
 }
@@ -3822,14 +4381,6 @@ function createFontSelect(currentFont: string): HTMLSelectElement {
   return select
 }
 
-function getBaseLayerObject(): FabricImage | null {
-  const object = layerById.get(baseLayerId)
-  if (!object || !(object instanceof FabricImage)) {
-    return null
-  }
-  return object
-}
-
 function isEditingField(target: EventTarget | null): boolean {
   if (!(target instanceof HTMLElement)) {
     return false
@@ -3850,10 +4401,6 @@ function removeSelectedLayer(): void {
   }
 
   const meta = getLayerMeta(activeObject)
-  if (meta.id === baseLayerId) {
-    return
-  }
-
   if (meta.scope !== activeEditMode) {
     return
   }
@@ -3873,7 +4420,7 @@ function nudgeSelectedLayer(key: string): boolean {
   }
 
   const meta = getLayerMeta(activeObject)
-  if (meta.id === baseLayerId || meta.scope !== activeEditMode) {
+  if (meta.scope !== activeEditMode || meta.locked || meta.isBackground) {
     return false
   }
 
@@ -3918,7 +4465,7 @@ function renderLayersAccordion(): void {
   ordered.forEach((object, reverseIndex) => {
     const meta = getLayerMeta(object)
     const zFromTop = reverseIndex
-    const editable = meta.kind !== 'base' && meta.scope === activeEditMode
+    const editable = meta.scope === activeEditMode
     const scopeLabel = meta.scope === 'model' ? 'Modelo' : 'Baralho'
 
     const details = document.createElement('details')
@@ -3950,11 +4497,16 @@ function renderLayersAccordion(): void {
     const summary = document.createElement('summary')
     summary.className = 'layer-summary'
     summary.draggable = editable
-    summary.innerHTML = `
-      <span class="layer-name">${meta.name}</span>
-      <span class="layer-kind">${scopeLabel} • ${layerKindLabel(meta.kind)}</span>
-      <span class="layer-z">z:${zFromTop}</span>
-    `
+    const nameLabel = document.createElement('span')
+    nameLabel.className = 'layer-name'
+    nameLabel.textContent = meta.name
+    const kindLabel = document.createElement('span')
+    kindLabel.className = 'layer-kind'
+    kindLabel.textContent = `${scopeLabel} • ${layerKindLabel(meta.kind)}`
+    const zLabel = document.createElement('span')
+    zLabel.className = 'layer-z'
+    zLabel.textContent = `z:${zFromTop}`
+    summary.append(nameLabel, kindLabel, zLabel)
 
     summary.addEventListener('dragstart', (event) => {
       if (!editable) {
@@ -3986,10 +4538,59 @@ function renderLayersAccordion(): void {
     selectBtn.type = 'button'
     selectBtn.className = 'tiny ghost'
     selectBtn.textContent = 'Selecionar'
-    selectBtn.disabled = !editable && meta.kind !== 'base'
+    selectBtn.disabled = !editable
     selectBtn.addEventListener('click', (event) => {
       event.preventDefault()
       selectLayer(meta.id)
+    })
+
+    const renameBtn = document.createElement('button')
+    renameBtn.type = 'button'
+    renameBtn.className = 'tiny ghost layer-toggle'
+    renameBtn.innerHTML = '<span class="material-symbols-outlined" aria-hidden="true">edit</span>'
+    renameBtn.title = `Renomear layer ${meta.name}`
+    renameBtn.setAttribute('aria-label', renameBtn.title)
+    renameBtn.disabled = !editable
+    renameBtn.addEventListener('click', (event) => {
+      event.preventDefault()
+      event.stopPropagation()
+
+      const input = document.createElement('input')
+      input.type = 'text'
+      input.className = 'layer-name-edit'
+      input.value = getLayerMeta(object).name
+      input.maxLength = 80
+      input.setAttribute('aria-label', `Nome da layer ${meta.name}`)
+      attachNoDragPropagation(input)
+      input.addEventListener('click', (inputEvent) => inputEvent.stopPropagation())
+
+      let finished = false
+      const finishRename = (save: boolean): void => {
+        if (finished) return
+        finished = true
+        const nextName = input.value.trim()
+        if (save && nextName) {
+          setLayerMeta(object, { ...getLayerMeta(object), name: nextName })
+          persistActiveDeckDocument()
+        }
+        canvas.requestRenderAll()
+        renderLayersAccordion()
+      }
+
+      input.addEventListener('keydown', (keyEvent) => {
+        keyEvent.stopPropagation()
+        if (keyEvent.key === 'Enter') {
+          keyEvent.preventDefault()
+          finishRename(true)
+        } else if (keyEvent.key === 'Escape') {
+          keyEvent.preventDefault()
+          finishRename(false)
+        }
+      })
+      input.addEventListener('blur', () => finishRename(true))
+      nameLabel.replaceWith(input)
+      input.focus()
+      input.select()
     })
 
     const upBtn = document.createElement('button')
@@ -4012,9 +4613,36 @@ function renderLayersAccordion(): void {
       moveLayer(meta.id, 'down')
     })
 
-    actions.append(selectBtn, upBtn, downBtn)
+    actions.append(selectBtn, renameBtn, upBtn, downBtn)
 
-    if (meta.id !== baseLayerId) {
+    const lockBtn = document.createElement('button')
+    lockBtn.type = 'button'
+    lockBtn.className = `tiny ghost layer-toggle ${meta.locked ? 'is-active' : ''}`
+    lockBtn.innerHTML = `<span class="material-symbols-outlined" aria-hidden="true">${meta.locked ? 'lock' : 'lock_open'}</span>`
+    lockBtn.title = meta.locked ? 'Destravar posicionamento' : 'Travar posicionamento'
+    lockBtn.setAttribute('aria-label', lockBtn.title)
+    lockBtn.disabled = !editable
+    lockBtn.addEventListener('click', (event) => {
+      event.preventDefault()
+      event.stopPropagation()
+      setLayerLocked(meta.id, !meta.locked)
+    })
+
+    const backgroundBtn = document.createElement('button')
+    backgroundBtn.type = 'button'
+    backgroundBtn.className = `tiny ghost layer-toggle ${meta.isBackground ? 'is-active' : ''}`
+    backgroundBtn.innerHTML = '<span class="material-symbols-outlined" aria-hidden="true">wallpaper</span>'
+    backgroundBtn.title = meta.isBackground ? 'Remover comportamento de background' : 'Usar como background da carta'
+    backgroundBtn.setAttribute('aria-label', backgroundBtn.title)
+    backgroundBtn.disabled = !editable
+    backgroundBtn.addEventListener('click', (event) => {
+      event.preventDefault()
+      event.stopPropagation()
+      setLayerBackground(meta.id, !meta.isBackground)
+    })
+    actions.append(lockBtn, backgroundBtn)
+
+    {
       const removeBtn = document.createElement('button')
       removeBtn.type = 'button'
       removeBtn.className = 'tiny danger'
@@ -4035,15 +4663,6 @@ function renderLayersAccordion(): void {
 }
 
 function buildLayerBody(object: FabricObject, meta: LayerMeta, editable: boolean, body: HTMLElement): void {
-    if (meta.id === baseLayerId) {
-      const lockNote = document.createElement('p')
-      lockNote.className = 'layer-note'
-      lockNote.textContent =
-        'Layer base bloqueada: use apenas Subir/Descer ou arraste na lista de layers para mudar a ordem.'
-      body.append(lockNote)
-      return
-    }
-
     if (!editable) {
       const canEditCardContent =
         activeEditMode === 'deck' &&
@@ -4065,6 +4684,8 @@ function buildLayerBody(object: FabricObject, meta: LayerMeta, editable: boolean
             persistActiveDeckDocument()
             renderCardThumbnails()
           }
+
+          renderRichTextEditor(body, textObject, commitCardTextChanges)
 
           const hint = document.createElement('p')
           hint.className = 'layer-note'
@@ -4175,7 +4796,7 @@ function buildLayerBody(object: FabricObject, meta: LayerMeta, editable: boolean
             textObject.set({ fill: fillField.value })
             const currentMeta = getLayerMeta(textObject)
             const sourceText = currentMeta.richTextSource ?? String((textObject as any).text ?? '')
-            applyTaggedTextToObject(textObject, sourceText)
+            applyRichTextToObject(textObject, sourceText, currentMeta.richTextFormat ?? 'tags')
             commitCardTextChanges()
           })
           body.append(detailsRow('Cor base do texto', fillField))
@@ -4203,20 +4824,7 @@ function buildLayerBody(object: FabricObject, meta: LayerMeta, editable: boolean
           })
           body.append(detailsRow('Espessura da borda', strokeWidthField))
 
-          const alignField = document.createElement('select')
-          attachNoDragPropagation(alignField)
-          ;(['left', 'center', 'right', 'justify'] as TextAlignMode[]).forEach((align) => {
-            const option = document.createElement('option')
-            option.value = align
-            option.textContent = align
-            option.selected = normalizeTextAlign((textObject as any).textAlign, 'left') === align
-            alignField.append(option)
-          })
-          alignField.addEventListener('change', () => {
-            textObject.set({ textAlign: alignField.value as TextAlignMode })
-            commitCardTextChanges()
-          })
-          body.append(detailsRow('Alinhamento', alignField))
+          body.append(createTextLayoutControls(textObject, commitCardTextChanges))
 
           const lineHeightField = document.createElement('input')
           lineHeightField.type = 'number'
@@ -4304,6 +4912,7 @@ function buildLayerBody(object: FabricObject, meta: LayerMeta, editable: boolean
           shadowEnabledField.addEventListener('change', applyShadow)
           shadowColorField.addEventListener('input', applyShadow)
           shadowBlurField.addEventListener('input', applyShadow)
+          removeLegacyTaggedTextControls(body)
         }
 
         if (meta.kind === 'image' && object instanceof FabricImage) {
@@ -4331,6 +4940,7 @@ function buildLayerBody(object: FabricObject, meta: LayerMeta, editable: boolean
     xInput.type = 'number'
     xInput.step = '1'
     xInput.value = String(Math.round(object.left ?? 0))
+    xInput.disabled = Boolean(meta.locked || meta.isBackground)
     attachNoDragPropagation(xInput)
     xInput.addEventListener('input', () => {
       object.set({ left: Number(xInput.value) || 0 })
@@ -4343,6 +4953,7 @@ function buildLayerBody(object: FabricObject, meta: LayerMeta, editable: boolean
     yInput.type = 'number'
     yInput.step = '1'
     yInput.value = String(Math.round(object.top ?? 0))
+    yInput.disabled = Boolean(meta.locked || meta.isBackground)
     attachNoDragPropagation(yInput)
     yInput.addEventListener('input', () => {
       object.set({ top: Number(yInput.value) || 0 })
@@ -4370,6 +4981,7 @@ function buildLayerBody(object: FabricObject, meta: LayerMeta, editable: boolean
     scaleInput.max = '3'
     scaleInput.step = '0.01'
     scaleInput.value = String(object.scaleX ?? 1)
+    scaleInput.disabled = Boolean(meta.locked || meta.isBackground)
     attachNoDragPropagation(scaleInput)
     scaleInput.addEventListener('input', () => {
       const scale = Number(scaleInput.value) || 1
@@ -4377,7 +4989,9 @@ function buildLayerBody(object: FabricObject, meta: LayerMeta, editable: boolean
       object.setCoords()
       canvas.requestRenderAll()
     })
-    body.append(detailsRow('Escala', scaleInput))
+    if (!isTextLayer(object)) {
+      body.append(detailsRow('Escala', scaleInput))
+    }
 
     const angleInput = document.createElement('input')
     angleInput.type = 'range'
@@ -4385,6 +4999,7 @@ function buildLayerBody(object: FabricObject, meta: LayerMeta, editable: boolean
     angleInput.max = '180'
     angleInput.step = '1'
     angleInput.value = String(object.angle ?? 0)
+    angleInput.disabled = Boolean(meta.locked || meta.isBackground)
     attachNoDragPropagation(angleInput)
     angleInput.addEventListener('input', () => {
       object.set({ angle: Number(angleInput.value) || 0 })
@@ -4404,6 +5019,12 @@ function buildLayerBody(object: FabricObject, meta: LayerMeta, editable: boolean
 
     if (isTextLayer(object)) {
       const textObject = object as FabricText | Textbox
+
+      renderRichTextEditor(body, textObject, () => {
+        textObject.setCoords()
+        canvas.requestRenderAll()
+        persistActiveDeckDocument()
+      })
 
       const textHint = document.createElement('p')
       textHint.className = 'layer-note'
@@ -4491,8 +5112,9 @@ function buildLayerBody(object: FabricObject, meta: LayerMeta, editable: boolean
       attachNoDragPropagation(fillField)
       fillField.addEventListener('input', () => {
         textObject.set({ fill: fillField.value })
-        const sourceText = getLayerMeta(textObject).richTextSource ?? String((textObject as any).text ?? '')
-        applyTaggedTextToObject(textObject, sourceText)
+        const currentMeta = getLayerMeta(textObject)
+        const sourceText = currentMeta.richTextSource ?? String((textObject as any).text ?? '')
+        applyRichTextToObject(textObject, sourceText, currentMeta.richTextFormat ?? 'tags')
         canvas.requestRenderAll()
       })
       body.append(detailsRow('Cor base do texto', fillField))
@@ -4522,37 +5144,11 @@ function buildLayerBody(object: FabricObject, meta: LayerMeta, editable: boolean
       })
       body.append(detailsRow('Espessura da borda', strokeWidthField))
 
-      const alignField = document.createElement('select')
-      attachNoDragPropagation(alignField)
-      ;['left', 'center', 'right', 'justify'].forEach((align) => {
-        const option = document.createElement('option')
-        option.value = align
-        option.textContent = align
-        option.selected = (textObject as any).textAlign === align
-        alignField.append(option)
-      })
-      alignField.addEventListener('change', () => {
-        textObject.set({ textAlign: alignField.value as 'left' | 'center' | 'right' | 'justify' })
+      body.append(createTextLayoutControls(textObject, () => {
         textObject.setCoords()
         canvas.requestRenderAll()
-      })
-      body.append(detailsRow('Alinhamento', alignField))
-
-      if (textObject instanceof Textbox) {
-        const widthField = document.createElement('input')
-        widthField.type = 'number'
-        widthField.min = '40'
-        widthField.max = '800'
-        widthField.step = '1'
-        widthField.value = String(Math.round(textObject.width ?? 260))
-        attachNoDragPropagation(widthField)
-        widthField.addEventListener('input', () => {
-          textObject.set({ width: clamp(40, 800, Number(widthField.value) || 260) })
-          textObject.setCoords()
-          canvas.requestRenderAll()
-        })
-        body.append(detailsRow('Largura (quebra automatica)', widthField))
-      }
+        persistActiveDeckDocument()
+      }))
 
       const lineHeightField = document.createElement('input')
       lineHeightField.type = 'number'
@@ -4655,6 +5251,7 @@ function buildLayerBody(object: FabricObject, meta: LayerMeta, editable: boolean
       shadowEnabledField.addEventListener('change', applyShadow)
       shadowColorField.addEventListener('input', applyShadow)
       shadowBlurField.addEventListener('input', applyShadow)
+      removeLegacyTaggedTextControls(body)
     }
 
     if (meta.kind === 'image' && object instanceof FabricImage) {
@@ -4662,20 +5259,10 @@ function buildLayerBody(object: FabricObject, meta: LayerMeta, editable: boolean
     }
 }
 
-async function fileToDataUrl(file: File): Promise<string> {
+async function fileToObjectUrl(file: File): Promise<string> {
   return withLoading(async () => {
-    return new Promise((resolve, reject) => {
-      const reader = new FileReader()
-      reader.onload = () => {
-        if (typeof reader.result === 'string') {
-          resolve(reader.result)
-        } else {
-          reject(new Error('Falha ao converter arquivo em base64.'))
-        }
-      }
-      reader.onerror = () => reject(new Error('Falha ao ler arquivo.'))
-      reader.readAsDataURL(file)
-    })
+    // Fabric and history keep this URL; unlike a data URL, it references the original Blob without a Base64 copy.
+    return URL.createObjectURL(file)
   })
 }
 
@@ -4843,7 +5430,6 @@ function createShapeObject(type: ShapeType): FabricObject {
 }
 
 function addShapeLayer(type: ShapeType): void {
-  if (activeEditMode === 'deck') return
   const shape = createShapeObject(type)
   setLayerMeta(shape, {
     id: generateLayerId(),
@@ -4932,6 +5518,7 @@ function createShapeControls(object: FabricObject): DocumentFragment {
   }
 
   const sizeW = numberField(Math.round((object.width ?? 0) * (object.scaleX ?? 1)), 1, 2000)
+  sizeW.disabled = Boolean(getLayerMeta(object).locked || getLayerMeta(object).isBackground)
   sizeW.addEventListener('input', () => {
     const value = Number(sizeW.value)
     if (value >= 1 && (object.width ?? 0) > 0) {
@@ -4943,6 +5530,7 @@ function createShapeControls(object: FabricObject): DocumentFragment {
 
   if (!isLine) {
     const sizeH = numberField(Math.round((object.height ?? 0) * (object.scaleY ?? 1)), 1, 2000)
+    sizeH.disabled = Boolean(getLayerMeta(object).locked || getLayerMeta(object).isBackground)
     sizeH.addEventListener('input', () => {
       const value = Number(sizeH.value)
       if (value >= 1 && (object.height ?? 0) > 0) {
@@ -5077,7 +5665,7 @@ function renderLibrary(): void {
     insertBtn.append(img)
     insertBtn.addEventListener('click', async () => {
       await addLibraryGraphic(asset)
-      libraryModal.hidden = true
+      assetsModal.hidden = true
     })
 
     const removeBtn = document.createElement('button')
@@ -5258,7 +5846,7 @@ async function addFilesToLibrary(files: FileList): Promise<void> {
   const deck = currentDeck()
   for (const file of Array.from(files)) {
     if (!file.type.startsWith('image/')) continue
-    const src = await fileToDataUrl(file)
+    const src = await fileToObjectUrl(file)
     let size = { width: 200, height: 200 }
     try {
       const element = await loadImageElement(src)
@@ -5395,14 +5983,12 @@ async function applyCardTemplate(preset: CardTemplatePreset): Promise<void> {
   destroySelectedTextEditor()
   canvas.clear()
   layerById.clear()
-  baseLayerId = ''
 
   await withLoading(async () => {
     const layout = templateLayoutSpec(preset)
     const base = await FabricImage.fromURL(svgDataUrl(templateBaseSvg(preset)))
     base.set({ left: 0, top: 0, originX: 'left', originY: 'top' })
-    baseLayerId = generateLayerId()
-    setLayerMeta(base, { id: baseLayerId, kind: 'base', name: `Base • ${preset.name}`, scope: 'model' })
+    setLayerMeta(base, { id: generateLayerId(), kind: 'image', name: `Base • ${preset.name}`, scope: 'model', isBackground: true })
     applyRuntimeConfig(base)
 
     const illustration = await FabricImage.fromURL(svgDataUrl(templateIllustrationSvg(preset, layout.art.width, layout.art.height)))
@@ -5500,85 +6086,14 @@ function renderTemplateGallery(isNewModel = false): void {
   })
 }
 
-async function ensureBaseLayer(url?: string): Promise<void> {
-  return withLoading(async () => {
-    if (!url) {
-      return
-    }
-
-    const baseImage = await FabricImage.fromURL(url)
-
-    const imageWidth = baseImage.width ?? CARD_WIDTH
-    const imageHeight = baseImage.height ?? CARD_HEIGHT
-
-    baseImage.set({
-      left: 0,
-      top: 0,
-      originX: 'left',
-      originY: 'top',
-      scaleX: CARD_WIDTH / imageWidth,
-      scaleY: CARD_HEIGHT / imageHeight,
-    })
-
-    baseLayerId = generateLayerId()
-    setLayerMeta(baseImage, {
-      id: baseLayerId,
-      kind: 'base',
-      name: 'Carta base',
-      scope: activeEditMode === 'back' ? 'back' : 'model',
-    })
-
-    applyRuntimeConfig(baseImage)
-    canvas.add(baseImage)
-    canvas.bringObjectToFront(baseImage)
-    refreshLayerIndex()
-    renderLayersAccordion()
-    persistActiveDeckDocument()
-    canvas.requestRenderAll()
-  })
-}
-
-async function replaceBaseLayer(url: string): Promise<void> {
-  return withLoading(async () => {
-    let baseObject = getBaseLayerObject()
-
-    if (!baseObject) {
-      await ensureBaseLayer(url)
-      baseObject = getBaseLayerObject()
-      if (!baseObject) {
-        throw new Error('Nao foi possivel preparar a layer base da carta.')
-      }
-    } else {
-      await baseObject.setSrc(url)
-    }
-
-    const imageWidth = baseObject.width ?? CARD_WIDTH
-    const imageHeight = baseObject.height ?? CARD_HEIGHT
-
-    baseObject.set({
-      left: 0,
-      top: 0,
-      originX: 'left',
-      originY: 'top',
-      scaleX: CARD_WIDTH / imageWidth,
-      scaleY: CARD_HEIGHT / imageHeight,
-    })
-
-    applyRuntimeConfig(baseObject)
-    baseObject.setCoords()
-    refreshLayerIndex()
-    renderLayersAccordion()
-    persistActiveDeckDocument()
-    canvas.requestRenderAll()
-  })
-}
-
 function createCard(modelId: string, backId: string): void {
   persistActiveDeckDocument()
   const deck = currentDeck()
+  const model = deck.models.find((item) => item.id === modelId) ?? activeModelOf(deck)
   const newCard: CardState = {
     id: generateDeckId(),
     name: `Carta ${deck.cards.length + 1}`,
+    canvas: createCardCanvasFromModel(model),
     deckObjects: [],
     modelId,
     backId,
@@ -5765,50 +6280,18 @@ async function deleteVariant(): Promise<void> {
   if (deck.models.length <= 1) return
   const target = activeModelOf(deck)
   const affected = deck.cards.filter(c => c.modelId === target.id).length
-  const otherModels = deck.models.filter(m => m.id !== target.id)
-  const DELETE_CARDS = '__delete__'
   const result = await openConfirm(
     'Excluir modelo',
     affected > 0
-      ? `O modelo "${target.name}" será excluído. Escolha o que fazer com as ${affected} carta(s) que o usam. Esta ação não pode ser desfeita.`
+      ? `O modelo "${target.name}" será excluído. As ${affected} carta(s) criadas a partir dele manterão seus layers independentes.`
       : `O modelo "${target.name}" será excluído. Esta ação não pode ser desfeita.`,
     'Excluir modelo',
-    affected > 0
-      ? {
-        label: 'Cartas deste modelo',
-        options: [
-          { value: DELETE_CARDS, label: `Excluir as ${affected} carta(s)`, acceptLabel: 'Excluir modelo e cartas' },
-          ...otherModels.map(m => ({ value: m.id, label: `Mudar para "${m.name}"`, acceptLabel: 'Excluir modelo e mudar cartas' })),
-        ],
-      }
-      : undefined,
   )
   if (!result.ok) return
 
-  const destination = deck.models.find(m => m.id === result.choice && m.id !== target.id)
   deck.models = deck.models.filter(m => m.id !== target.id)
-  if (destination) {
-    const destinationIds = new Set(((destination.canvas.objects ?? []) as unknown[]).map(layerIdFromSerialized).filter(Boolean))
-    deck.cards.forEach((card) => {
-      if (card.modelId !== target.id) return
-      card.modelId = destination.id
-      card.modelOverrides = Object.fromEntries(Object.entries(card.modelOverrides).filter(([id]) => destinationIds.has(id)))
-    })
-  } else {
-    deck.cards = deck.cards.filter(c => c.modelId !== target.id)
-  }
-  const fallback = destination ?? deck.models[0]
-  if (deck.cards.length === 0) {
-    deck.cards.push({
-      id: generateDeckId(),
-      name: 'Carta 1',
-      deckObjects: [],
-      modelId: fallback.id,
-      backId: deck.backs[0].id,
-      modelOverrides: {},
-      thumbnail: '',
-    })
-  }
+  const fallback = deck.models[0]
+  deck.cards.forEach((card) => { if (card.modelId === target.id) card.modelId = fallback.id })
   if (!deck.cards.some(c => c.id === deck.activeCardId)) deck.activeCardId = deck.cards[0].id
   deck.activeModelId = fallback.id
   destroySelectedTextEditor()
@@ -5835,27 +6318,25 @@ function renderCardVariantControls(): void {
 }
 
 async function changeActiveCardModel(modelId: string): Promise<void> {
-  persistActiveDeckDocument()
   const deck = currentDeck()
   const card = deck.cards.find(c => c.id === deck.activeCardId)
   const next = deck.models.find(m => m.id === modelId)
   if (!card || !next || card.modelId === modelId) return
 
-  const nextIds = new Set(((next.canvas.objects ?? []) as unknown[]).map(layerIdFromSerialized).filter(Boolean))
-  const lost = Object.keys(card.modelOverrides).filter(id => !nextIds.has(id))
-  if (lost.length > 0) {
-    const ok = await confirmDialog(
-      'Trocar modelo da carta',
-      `${lost.length} personalização(ões) desta carta não existem no modelo "${next.name}" e serão descartadas.`,
-      'Trocar modelo',
-    )
-    if (!ok) {
-      renderCardVariantControls()
-      return
-    }
+  const ok = await confirmDialog(
+    'Recriar carta a partir do modelo',
+    `Os layers atuais de "${card.name}" serão substituídos por uma cópia independente do modelo "${next.name}".`,
+    'Recriar carta',
+  )
+  if (!ok) {
+    renderCardVariantControls()
+    return
   }
-  card.modelOverrides = Object.fromEntries(Object.entries(card.modelOverrides).filter(([id]) => nextIds.has(id)))
+  persistActiveDeckDocument()
   card.modelId = modelId
+  card.canvas = createCardCanvasFromModel(next)
+  card.deckObjects = []
+  card.modelOverrides = {}
   deck.activeModelId = modelId
   await loadActiveDeckCard(deck, card.id)
   await refreshDeckThumbnails(deck)
@@ -5952,24 +6433,85 @@ function selectCard(cardId: string): void {
   renderCardThumbnails()
 }
 
-async function saveActiveDeckAsFile(): Promise<void> {
+function deckAutosaveSnapshot(): unknown {
+  persistActiveDeckDocument()
+  const deck = currentDeck()
+  return stripImagePayloads({
+    version: 1,
+    deck: {
+      id: deck.id,
+      name: deck.name,
+      models: deck.models.map(model => ({ id: model.id, name: model.name, canvas: model.canvas })),
+      backs: deck.backs.map(back => ({ id: back.id, name: back.name, canvas: back.canvas, thumbnail: back.thumbnail })),
+      library: deck.library,
+      activeModelId: deck.activeModelId,
+      activeBackId: deck.activeBackId,
+      cards: deck.cards,
+      activeCardId: deck.activeCardId,
+      cover: deck.cover ?? '',
+    },
+  })
+}
+
+let autosaveRunning = false
+
+async function runLightweightAutosave(): Promise<void> {
+  if (autosaveRunning) return
+  autosaveRunning = true
   try {
-    await withLoading(async () => {
-      syncDeckFilename()
-      const snapshot = deckFileSnapshot()
-      const filename = `${snapshot.deck.name}.deck`
-      const blob = await compressTextToBlob(JSON.stringify(snapshot))
-      downloadBlob(filename, blob)
+    await saveLightweightAutosave(deckAutosaveSnapshot(), {
+      key: history.key,
+      index: history.index,
+      count: history.stack.length,
     })
   } catch (error) {
+    console.warn('Falha no autosave local do projeto.', error)
+  } finally {
+    autosaveRunning = false
+  }
+}
+
+async function runCompleteAutosave(): Promise<void> {
+  if (autosaveRunning || !activeDeckFileHandle || !(await activeDeckPermissionGranted())) return
+  autosaveRunning = true
+  try {
+    const blob = await createDeckArchive(deckFileSnapshot())
+    await writeActiveDeckFile(blob)
+  } catch (error) {
+    console.warn('Falha no autosave completo do projeto.', error)
+  } finally {
+    autosaveRunning = false
+  }
+}
+
+window.setInterval(() => { void runLightweightAutosave() }, 30_000)
+window.setInterval(() => { void runCompleteAutosave() }, 5 * 60_000)
+
+async function saveActiveDeckAsFile(): Promise<void> {
+  try {
+    syncDeckFilename()
+    const filename = `${currentDeck().name || DEFAULT_DECK_NAME}.deck`
+    const selection = activeDeckFileHandle ? 'selected' : await selecionarLocalArquivo(filename)
+    if (selection === 'cancelled') return
+
+    await withLoading(async () => {
+      const blob = await createDeckArchive(deckFileSnapshot())
+      if (selection === 'unsupported' || !(await writeActiveDeckFile(blob))) {
+        downloadBlob(filename, blob)
+      }
+    })
+  } catch (error) {
+    if (error instanceof DOMException && error.name === 'NotAllowedError') {
+      clearActiveDeckFileHandle()
+    }
     window.alert(error instanceof Error ? error.message : 'Falha ao salvar baralho.')
   }
 }
 
 async function importDeckFile(file: File): Promise<void> {
   return withLoading(async () => {
-    const rawText = await decompressDeckText(file)
-    const parsed = JSON.parse(rawText) as Record<string, unknown>
+    const archived = await readDeckArchive(file)
+    const parsed = (archived ?? JSON.parse(await decompressDeckText(file))) as Record<string, unknown>
 
     let rawDeck: Record<string, unknown> | null = null
 
@@ -6302,7 +6844,7 @@ function attachCanvasDnD(): void {
       }
 
       try {
-        const dataUrl = await fileToDataUrl(file)
+        const dataUrl = await fileToObjectUrl(file)
         await addImageLayer(dataUrl, file.name)
       } catch {
         window.alert(`Falha ao carregar a imagem ${file.name}.`)
@@ -6394,12 +6936,17 @@ editModelButton.addEventListener('click', () => {
 })
 
 editDeckButton.addEventListener('click', () => {
-  if (activeEditMode === 'deck') {
-    activeRightPanelTab = 'cards'
-    renderWorkspaceTabs()
+  if (activeEditMode !== 'deck') {
+    deckPreviewHidden = false
+    localStorage.setItem(DECK_PREVIEW_HIDDEN_STORAGE_KEY, 'false')
+    void switchToCardView()
     return
   }
-  void switchToCardView()
+
+  deckPreviewHidden = !deckPreviewHidden
+  localStorage.setItem(DECK_PREVIEW_HIDDEN_STORAGE_KEY, String(deckPreviewHidden))
+  syncDeckPreviewVisibility()
+  fitCanvasZoomToStage()
 })
 exportDeckButton.addEventListener('click', saveActiveDeckAsFile)
 deckNameInput.addEventListener('input', () => {
@@ -6423,16 +6970,12 @@ variantNameInput.addEventListener('input', renameVariant)
 variantDeleteButton.addEventListener('click', () => { void deleteVariant() })
 cardModelSelect.addEventListener('change', () => { void changeActiveCardModel(cardModelSelect.value) })
 cardBackSelect.addEventListener('change', () => { changeActiveCardBack(cardBackSelect.value) })
-changeBaseButton.addEventListener('click', () => {
-  modelToolsModal.hidden = true
-  baseImageInput.click()
-})
 
 importDeckButton.addEventListener('click', () => {
   importDeckInput.click()
 })
 
-interface PresetDeckEntry { name: string; file: string; description?: string }
+interface PresetDeckEntry { name: string; file: string; description?: string; cover?: string }
 
 const presetCoverCache = new Map<string, Promise<string>>()
 
@@ -6501,9 +7044,13 @@ async function loadPresetDecks(): Promise<void> {
 
       const cover = document.createElement('div')
       cover.className = 'preset-deck-cover'
-      void fetchPresetCover(entry.file).then((src) => {
-        if (src) cover.style.backgroundImage = `url("${src}")`
-      })
+      if (entry.cover) {
+        cover.style.backgroundImage = `url("${import.meta.env.BASE_URL}decks/${entry.cover.split('/').map(encodeURIComponent).join('/')}")`
+      } else {
+        void fetchPresetCover(entry.file).then((src) => {
+          if (src) cover.style.backgroundImage = `url("${src}")`
+        })
+      }
       li.append(cover)
 
       const info = document.createElement('div')
@@ -6524,16 +7071,18 @@ async function loadPresetDecks(): Promise<void> {
       editBtn.type = 'button'
       editBtn.className = 'preset-deck-btn'
       editBtn.textContent = 'Editar'
-      editBtn.addEventListener('click', async () => {
-        try {
-          const res = await fetch(presetDeckUrl(entry.file))
-          if (!res.ok) throw new Error('Não foi possível carregar o deck.')
-          const blob = await res.blob()
-          await importDeckFile(new File([blob], `${entry.name}.deck`))
-          presetDecksModal.hidden = true
-        } catch (error) {
-          window.alert(error instanceof Error ? error.message : 'Falha ao carregar deck.')
-        }
+      editBtn.addEventListener('click', () => {
+        void withLoading(async () => {
+          try {
+            const res = await fetch(presetDeckUrl(entry.file))
+            if (!res.ok) throw new Error('Não foi possível carregar o deck.')
+            const blob = await res.blob()
+            await importDeckFile(new File([blob], `${entry.name}.deck`))
+            presetDecksModal.hidden = true
+          } catch (error) {
+            window.alert(error instanceof Error ? error.message : 'Falha ao carregar deck.')
+          }
+        })
       })
 
       const link = document.createElement('a')
@@ -6579,24 +7128,16 @@ importDeckInput.addEventListener('change', async () => {
 addCardButton.addEventListener('click', () => { void addNewCard() })
 
 addGraphicButton.addEventListener('click', () => {
-  if (activeEditMode === 'deck') {
-    window.alert('No modo Baralho, edite apenas os layers existentes da carta.')
-    return
-  }
-  modelToolsModal.hidden = true
+  assetsModal.hidden = true
   void addGraphicReferenceLayer()
 })
 
-openModelToolsButton.addEventListener('click', () => { modelToolsModal.hidden = false })
-closeModelToolsButton.addEventListener('click', () => { modelToolsModal.hidden = true })
-modelToolsModalBackdrop.addEventListener('click', () => { modelToolsModal.hidden = true })
-
-openLibraryButton.addEventListener('click', () => {
+openAssetsButton.addEventListener('click', () => {
   renderLibrary()
-  libraryModal.hidden = false
+  assetsModal.hidden = false
 })
-closeLibraryButton.addEventListener('click', () => { libraryModal.hidden = true })
-libraryModalBackdrop.addEventListener('click', () => { libraryModal.hidden = true })
+closeAssetsButton.addEventListener('click', () => { assetsModal.hidden = true })
+assetsModalBackdrop.addEventListener('click', () => { assetsModal.hidden = true })
 libraryUploadButton.addEventListener('click', () => { libraryInput.click() })
 libraryInput.addEventListener('change', async () => {
   const files = libraryInput.files
@@ -6614,15 +7155,11 @@ shapePalette.addEventListener('click', (event) => {
   const button = (event.target as HTMLElement).closest<HTMLButtonElement>('button[data-shape]')
   if (!button || button.disabled) return
   addShapeLayer(button.dataset.shape as ShapeType)
-  modelToolsModal.hidden = true
+  assetsModal.hidden = true
 })
 
 addTextButton.addEventListener('click', () => {
-  if (activeEditMode === 'deck') {
-    window.alert('No modo Baralho, edite apenas os textos ja existentes da carta.')
-    return
-  }
-  modelToolsModal.hidden = true
+  assetsModal.hidden = true
   addTextLayer()
 })
 
@@ -6633,7 +7170,7 @@ imageInput.addEventListener('change', async () => {
   }
 
   try {
-    const dataUrl = await fileToDataUrl(file)
+    const dataUrl = await fileToObjectUrl(file)
     const activeObject = selectedEditableImageObject()
 
     if (activeObject) {
@@ -6650,22 +7187,6 @@ imageInput.addEventListener('change', async () => {
     window.alert('Falha ao carregar imagem selecionada.')
   } finally {
     imageInput.value = ''
-  }
-})
-
-baseImageInput.addEventListener('change', async () => {
-  const file = baseImageInput.files?.[0]
-  if (!file) {
-    return
-  }
-
-  try {
-    const dataUrl = await fileToDataUrl(file)
-    await replaceBaseLayer(dataUrl)
-  } catch {
-    window.alert('Falha ao substituir a imagem da carta base.')
-  } finally {
-    baseImageInput.value = ''
   }
 })
 
@@ -6689,11 +7210,8 @@ document.addEventListener('click', (event) => {
   if (!mainMenuPanel.hidden && !(event.target as HTMLElement).closest('.menu-dropdown')) setMainMenuOpen(false)
 })
 window.addEventListener('keydown', (event) => {
-  if (event.key === 'Escape' && !modelToolsModal.hidden) {
-    modelToolsModal.hidden = true
-  }
-  if (event.key === 'Escape' && !libraryModal.hidden) {
-    libraryModal.hidden = true
+  if (event.key === 'Escape' && !assetsModal.hidden) {
+    assetsModal.hidden = true
   }
   if (event.key === 'Escape' && !mainMenuPanel.hidden) {
     setMainMenuOpen(false)
@@ -6780,6 +7298,12 @@ canvasPanel.addEventListener('wheel', (event) => {
 }, { passive: false })
 
 window.addEventListener('keydown', (event) => {
+  if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 's' && !event.altKey && !event.shiftKey) {
+    event.preventDefault()
+    void saveActiveDeckAsFile()
+    return
+  }
+
   if (isEditingField(event.target)) {
     return
   }
@@ -6814,31 +7338,19 @@ window.addEventListener('keydown', (event) => {
 
 canvas.on('selection:created', () => {
   if (!suppressSelectionSync) {
-    if (activeEditMode !== 'deck') {
-      renderLayersAccordion()
-      return
-    }
-    renderEditorPanel()
+    renderLayersAccordion()
   }
 })
 
 canvas.on('selection:updated', () => {
   if (!suppressSelectionSync) {
-    if (activeEditMode !== 'deck') {
-      renderLayersAccordion()
-      return
-    }
-    renderEditorPanel()
+    renderLayersAccordion()
   }
 })
 
 canvas.on('selection:cleared', () => {
   if (!suppressSelectionSync) {
-    if (activeEditMode !== 'deck') {
-      renderLayersAccordion()
-      return
-    }
-    renderEditorPanel()
+    renderLayersAccordion()
   }
 })
 
