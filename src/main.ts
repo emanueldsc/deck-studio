@@ -18,6 +18,7 @@ import {
     Textbox,
     Triangle,
     type FabricObject,
+    type Point,
 } from 'fabric'
 import { jsPDF } from 'jspdf'
 import JSZip from 'jszip'
@@ -444,6 +445,7 @@ function backOfCard(deck: DeckDocument, card: CardState | undefined): CardBack {
 }
 
 function deepClone<T>(value: T): T {
+  if (value === undefined) return value
   return JSON.parse(JSON.stringify(value)) as T
 }
 
@@ -3447,6 +3449,9 @@ function renderSelectedTextEditor(textObject: FabricText | Textbox): void {
 function createGraphicSizeControls(graphic: FabricObject): DocumentFragment {
   const fragment = document.createDocumentFragment()
   const meta = getLayerMeta(graphic)
+  const pair = document.createElement('div')
+  pair.className = 'layer-detail-pair'
+  fragment.append(pair)
   const field = (label: string, current: number, apply: (value: number) => void): void => {
     const input = document.createElement('input')
     input.type = 'number'
@@ -3462,7 +3467,7 @@ function createGraphicSizeControls(graphic: FabricObject): DocumentFragment {
       canvas.requestRenderAll()
       persistActiveDeckDocument()
     })
-    fragment.append(detailsRow(label, input))
+    pair.append(detailsRow(label, input))
   }
   const naturalWidth = Math.max(1, graphic.width ?? 1)
   const naturalHeight = Math.max(1, graphic.height ?? 1)
@@ -3470,6 +3475,84 @@ function createGraphicSizeControls(graphic: FabricObject): DocumentFragment {
   field('Altura', naturalHeight * (graphic.scaleY ?? 1), (v) => graphic.set({ scaleY: v / naturalHeight }))
   fragment.querySelectorAll('input').forEach((input) => { input.disabled = Boolean(meta.locked || meta.isBackground) })
   return fragment
+}
+
+function createGraphicPositionControls(graphic: FabricObject): DocumentFragment {
+  const fragment = document.createDocumentFragment()
+  const meta = getLayerMeta(graphic)
+  const center = graphic.getCenterPoint()
+  const pair = document.createElement('div')
+  pair.className = 'layer-detail-pair'
+  fragment.append(pair)
+  const field = (label: string, current: number, apply: (point: Point, value: number) => void): void => {
+    const input = document.createElement('input')
+    input.type = 'number'
+    input.min = '-4000'
+    input.max = '4000'
+    input.value = String(Math.round(current))
+    input.disabled = Boolean(meta.locked || meta.isBackground)
+    attachNoDragPropagation(input)
+    input.addEventListener('input', () => {
+      if (input.value === '' || !Number.isFinite(Number(input.value))) return
+      const point = graphic.getCenterPoint()
+      apply(point, Number(input.value))
+      graphic.setPositionByOrigin(point, 'center', 'center')
+      graphic.setCoords()
+      canvas.requestRenderAll()
+      persistActiveDeckDocument()
+    })
+    pair.append(detailsRow(label, input))
+  }
+  field('Posição X', center.x, (point, value) => { point.x = value })
+  field('Posição Y', center.y, (point, value) => { point.y = value })
+  return fragment
+}
+
+async function duplicateGraphic(graphic: FabricObject, offset: number): Promise<FabricObject | null> {
+  const meta = getLayerMeta(graphic)
+  if (meta.kind !== 'graphic' || meta.scope !== activeEditMode || meta.locked || meta.isBackground) return null
+  const copy = await graphic.clone()
+  setLayerMeta(copy, { ...deepClone(meta), id: generateLayerId() })
+  copy.set({ left: (graphic.left ?? 0) + offset, top: (graphic.top ?? 0) + offset })
+  applyRuntimeConfig(copy)
+  return copy
+}
+
+async function duplicateSelectedGraphic(): Promise<void> {
+  const active = canvas.getActiveObject()
+  if (!active || active instanceof ActiveSelection) return
+  const copy = await duplicateGraphic(active, 20)
+  if (!copy) return
+  addPastedGraphic(copy)
+}
+
+let copiedGraphic: FabricObject | null = null
+
+async function copySelectedGraphic(): Promise<boolean> {
+  const active = canvas.getActiveObject()
+  if (!active || active instanceof ActiveSelection) return false
+  const copy = await duplicateGraphic(active, 0)
+  if (!copy) return false
+  copiedGraphic = copy
+  return true
+}
+
+async function pasteCopiedGraphic(): Promise<void> {
+  if (!copiedGraphic) return
+  const copy = await copiedGraphic.clone()
+  setLayerMeta(copy, { ...deepClone(getLayerMeta(copiedGraphic)), id: generateLayerId(), scope: activeEditMode })
+  applyRuntimeConfig(copy)
+  addPastedGraphic(copy)
+}
+
+function addPastedGraphic(copy: FabricObject): void {
+  canvas.add(copy)
+  canvas.setActiveObject(copy)
+  refreshLayerIndex()
+  renderLayersAccordion()
+  persistActiveDeckDocument()
+  canvas.requestRenderAll()
+  if (activeEditMode === 'deck') renderWorkspaceTabs()
 }
 
 function createGraphicScaleControls(graphic: FabricObject): DocumentFragment {
@@ -3566,6 +3649,89 @@ function createGraphicScaleControls(graphic: FabricObject): DocumentFragment {
   return fragment
 }
 
+async function replaceGraphicSource(graphic: FabricImage, source: string, name?: string): Promise<void> {
+  const meta = getLayerMeta(graphic)
+  const targetWidth = Math.max(1, Math.round((graphic.width ?? 1) * (graphic.scaleX ?? 1)))
+  const targetHeight = Math.max(1, Math.round((graphic.height ?? 1) * (graphic.scaleY ?? 1)))
+  let nextSrc = source
+  if (meta.scaleMode === 'nine-slice') {
+    nextSrc = await createNineSliceDataUrl(await FabricImage.fromURL(source), {
+      id: meta.id,
+      name: meta.name,
+      src: source,
+      width: targetWidth,
+      height: targetHeight,
+      scaleMode: 'nine-slice',
+      insetTop: meta.insetTop,
+      insetRight: meta.insetRight,
+      insetBottom: meta.insetBottom,
+      insetLeft: meta.insetLeft,
+    })
+  }
+  await graphic.setSrc(nextSrc)
+  graphic.set({
+    scaleX: targetWidth / Math.max(1, graphic.width ?? targetWidth),
+    scaleY: targetHeight / Math.max(1, graphic.height ?? targetHeight),
+  })
+  setLayerMeta(graphic, { ...meta, graphicSource: source, ...(name ? { name } : {}) })
+  graphic.setCoords()
+  refreshLayerIndex()
+  renderLayersAccordion()
+  canvas.requestRenderAll()
+  persistActiveDeckDocument()
+}
+
+function createGraphicReplaceControls(graphic: FabricObject): DocumentFragment {
+  const fragment = document.createDocumentFragment()
+  if (!(graphic instanceof FabricImage)) return fragment
+  const meta = getLayerMeta(graphic)
+  if (meta.locked || meta.isBackground) return fragment
+
+  const run = (source: string, name?: string): void => {
+    void withLoading(async () => {
+      try {
+        await replaceGraphicSource(graphic, source, name)
+      } catch {
+        window.alert('Falha ao substituir o asset.')
+      }
+    }).then(() => { if (canvas.getActiveObject() === graphic) renderSelectedItemEditor() })
+  }
+
+  const select = document.createElement('select')
+  select.innerHTML = '<option value="">Trocar por asset…</option>'
+  currentDeck().library.forEach((asset) => {
+    const option = document.createElement('option')
+    option.value = asset.id
+    option.textContent = asset.name
+    select.append(option)
+  })
+  attachNoDragPropagation(select)
+  select.addEventListener('change', () => {
+    const asset = currentDeck().library.find((item) => item.id === select.value)
+    if (asset) run(asset.src, asset.name)
+    select.value = ''
+  })
+
+  const fileInput = document.createElement('input')
+  fileInput.type = 'file'
+  fileInput.accept = 'image/*'
+  fileInput.hidden = true
+  fileInput.addEventListener('change', async () => {
+    const file = fileInput.files?.[0]
+    fileInput.value = ''
+    if (file) run(await fileToObjectUrl(file), file.name.replace(/\.[^.]+$/, '') || meta.name)
+  })
+  const fileButton = document.createElement('button')
+  fileButton.type = 'button'
+  fileButton.className = 'ghost tiny'
+  fileButton.textContent = 'Trocar por arquivo…'
+  attachNoDragPropagation(fileButton)
+  fileButton.addEventListener('click', () => fileInput.click())
+
+  fragment.append(detailsRow('Substituir asset', select), fileButton, fileInput)
+  return fragment
+}
+
 function renderSelectedGraphicEditor(graphic: FabricObject): void {
   const commit = (): void => {
     graphic.setCoords()
@@ -3590,6 +3756,8 @@ function renderSelectedGraphicEditor(graphic: FabricObject): void {
   }
 
   editPanelContent.append(
+    createGraphicReplaceControls(graphic),
+    createGraphicPositionControls(graphic),
     createGraphicSizeControls(graphic),
     createGraphicScaleControls(graphic),
     detailsRow('Opacidade', range(0, 1, 0.01, graphic.opacity ?? 1, (v) => { graphic.set({ opacity: v }); commit() })),
@@ -3631,6 +3799,7 @@ function renderSelectedItemEditor(): void {
 
   const meta = getLayerMeta(selected)
   editItemLabel.textContent = `${meta.name} • ${layerKindLabel(meta.kind)}`
+  editPanelContent.append(createLayerAttributeTransferControls(selected))
 
   if (meta.kind === 'graphic') {
     destroySelectedTextEditor()
@@ -3650,7 +3819,6 @@ function renderSelectedItemEditor(): void {
   }
 
   destroySelectedTextEditor()
-  editPanelContent.innerHTML = ''
   const body = document.createElement('div')
   body.className = 'layer-body'
   buildLayerBody(selected, meta, true, body)
@@ -3760,7 +3928,25 @@ function renderCardThumbnails(): void {
       deleteCard(card.id)
     })
 
-    actions.append(renameBtn, duplicateBtn, deleteBtn)
+    const moveWrap = document.createElement('div')
+    moveWrap.className = 'card-thumb-move'
+    const makeMoveBtn = (direction: -1 | 1): HTMLButtonElement => {
+      const button = document.createElement('button')
+      const label = direction < 0 ? `Subir ${card.name}` : `Descer ${card.name}`
+      const target = index + direction
+      button.type = 'button'
+      button.className = 'tiny ghost'
+      button.innerHTML = `<span class="material-symbols-outlined" aria-hidden="true">${direction < 0 ? 'keyboard_arrow_up' : 'keyboard_arrow_down'}</span>`
+      button.setAttribute('aria-label', label)
+      button.title = label
+      button.dataset.tooltip = label
+      button.disabled = target < 0 || target >= deck.cards.length
+      button.addEventListener('click', () => { moveCard(card.id, direction) })
+      return button
+    }
+    moveWrap.append(makeMoveBtn(-1), makeMoveBtn(1))
+
+    actions.append(renameBtn, duplicateBtn, deleteBtn, moveWrap)
     item.append(pair, meta, actions)
     cardThumbnails.append(item)
   })
@@ -3834,6 +4020,17 @@ function renameCard(cardId: string, requestedName: string): void {
   const { base, number } = splitCardName(requestedName)
   const nextNumber = Math.max(number, Number(nextCardName(deck, base, cardId).split(' ').at(-1)))
   card.name = `${base} ${nextNumber}`
+  renderCardThumbnails()
+}
+
+function moveCard(cardId: string, direction: -1 | 1): void {
+  persistActiveDeckDocument()
+  const deck = currentDeck()
+  const index = deck.cards.findIndex((card) => card.id === cardId)
+  const target = index + direction
+  if (index < 0 || target < 0 || target >= deck.cards.length) return
+  const [card] = deck.cards.splice(index, 1)
+  deck.cards.splice(target, 0, card)
   renderCardThumbnails()
 }
 
@@ -7310,6 +7507,20 @@ window.addEventListener('keydown', (event) => {
 
   if ((event.ctrlKey || event.metaKey) && !event.altKey) {
     const key = event.key.toLowerCase()
+    if (key === 'd') {
+      event.preventDefault()
+      void duplicateSelectedGraphic()
+      return
+    }
+    if (key === 'c') {
+      void copySelectedGraphic()
+      return
+    }
+    if (key === 'v' && copiedGraphic) {
+      event.preventDefault()
+      void pasteCopiedGraphic()
+      return
+    }
     if (key === 'z' || key === 'y') {
       event.preventDefault()
       void stepHistory(key === 'y' || event.shiftKey ? 1 : -1)
@@ -7352,6 +7563,20 @@ canvas.on('selection:cleared', () => {
   if (!suppressSelectionSync) {
     renderLayersAccordion()
   }
+})
+
+canvas.on('mouse:down', (event) => {
+  const target = event.target
+  if (!target || !(event.e as MouseEvent).altKey || target instanceof ActiveSelection) return
+  // Alt+arrastar: a cópia fica na posição original e o objeto arrastado segue o mouse.
+  const index = canvas.getObjects().indexOf(target)
+  void duplicateGraphic(target, 0).then((copy) => {
+    if (!copy) return
+    canvas.insertAt(index, copy)
+    refreshLayerIndex()
+    renderLayersAccordion()
+    canvas.requestRenderAll()
+  })
 })
 
 canvas.on('object:modified', (e) => {

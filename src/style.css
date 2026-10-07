@@ -857,6 +857,12 @@ button.tiny {
   display: block;
 }
 
+.layer-detail-pair {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+
 .layer-detail-row label {
   margin: 0;
 }
@@ -1540,8 +1546,23 @@ input[type='color'] {
 
 .card-thumb-actions {
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-columns: repeat(4, minmax(0, 1fr));
   gap: 6px;
+}
+
+.card-thumb-move {
+  display: grid;
+  grid-template-rows: 1fr 1fr;
+  gap: 2px;
+}
+
+.card-thumb-actions .card-thumb-move button {
+  min-height: 15px;
+  padding: 0;
+}
+
+.card-thumb-actions .card-thumb-move button .material-symbols-outlined {
+  font-size: 16px;
 }
 
 .card-thumb-actions button {
