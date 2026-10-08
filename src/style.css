@@ -1323,6 +1323,11 @@ input[type='color'] {
   white-space: nowrap;
 }
 
+.rich-toolbar button.is-active {
+  background: #cc4f1d;
+  color: #fff;
+}
+
 .rich-editor-surface {
   border: 1px solid #cbd5e1;
   border-radius: 10px;
@@ -1469,6 +1474,20 @@ input[type='color'] {
   justify-content: flex-end;
   gap: 10px;
   margin-top: 20px;
+}
+
+.asset-picker-dialog {
+  width: min(620px, calc(100vw - 32px));
+}
+
+.asset-picker-list {
+  max-height: 50vh;
+  overflow-y: auto;
+}
+
+.asset-picker-item img {
+  aspect-ratio: 1;
+  object-fit: contain;
 }
 
 .new-card-dialog h3 {
@@ -2128,3 +2147,33 @@ input[type='color'] {
   box-shadow: 1px 0 4px 0 rgba(0, 0, 0, 0.5), 0 4px 4px rgba(0, 0, 0, 0.5);
 }
 .canvas-stage.has-content { border-style: solid; border-color: var(--accent); }
+
+.print-cut-guide {
+  display: grid;
+  gap: 10px;
+  margin: 0;
+  padding: 10px 12px;
+  border: 1px solid var(--line, #cbd5e1);
+  border-radius: 10px;
+}
+
+.print-cut-guide legend {
+  padding: 0 6px;
+  font-weight: 700;
+}
+
+.print-cut-guide-options {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.print-cut-guide-options[hidden] {
+  display: none;
+}
+
+.print-cut-guide-options input[type='color'] {
+  width: 100%;
+  min-height: 36px;
+  padding: 3px;
+}

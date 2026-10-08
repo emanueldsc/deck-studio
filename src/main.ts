@@ -816,7 +816,7 @@ function parseHtmlRichText(
     const inlinePaddingY = paddingParts[0]
     const inlinePaddingX = paddingParts[1] ?? paddingParts[0]
     const inlineFontSize = Number.parseFloat(node.style.fontSize)
-    const inlineFontFamily = node.style.fontFamily.replace(/^['"]|['"]$/g, '')
+    const inlineFontFamily = /^(['"]).*\1$/.test(node.style.fontFamily) ? node.style.fontFamily.slice(1, -1) : node.style.fontFamily
     const inlineWeight = node.style.fontWeight
     const inlineStyle = node.style.fontStyle
     const textDecoration = node.style.textDecoration
@@ -872,7 +872,36 @@ function applyRichTextToObject(
     richTextSource: richText,
     richTextFormat: format,
   })
+  // Mudanças só de estilo (negrito, fonte, tamanho) não remedem o texto sozinhas.
+  textObject.initDimensions()
+  textObject.set('dirty', true)
   textObject.setCoords()
+}
+
+function textObjectToTagMarkup(textObject: FabricText | Textbox): string {
+  const styles = (textObject as unknown as { styles?: Record<number, Record<number, { fill?: unknown }>> }).styles ?? {}
+  const toHex = (value: unknown): string => {
+    try { return `#${new FabricColor(String(value)).toHex().toLowerCase()}` } catch { return '' }
+  }
+  const base = toHex((textObject as { fill?: unknown }).fill ?? '#1c2738')
+  let output = ''
+  let open = ''
+  String((textObject as { text?: unknown }).text ?? '').split('\n').forEach((line, lineIndex) => {
+    if (lineIndex > 0) output += '\n'
+    Array.from(line).forEach((character, charIndex) => {
+      const fill = styles[lineIndex]?.[charIndex]?.fill
+      const color = fill ? toHex(fill) : ''
+      const next = color && color !== base ? color : ''
+      if (next !== open) {
+        if (open) output += `</${open}>`
+        if (next) output += `<${next}>`
+        open = next
+      }
+      output += character
+    })
+  })
+  if (open) output += `</${open}>`
+  return output
 }
 
 function createTextLayoutControls(
@@ -1672,9 +1701,9 @@ function applyDeckModelImageFit(targetCanvas: Canvas): void {
     }
 
     // Keep model image slots stable for every render path (editor, thumbnails, print).
-    const fit = normalizeImageFit(meta.fit ?? 'contain')
-    const targetWidth = Math.max(1, meta.slotWidth ?? object.getScaledWidth?.() ?? object.width ?? 1)
-    const targetHeight = Math.max(1, meta.slotHeight ?? object.getScaledHeight?.() ?? object.height ?? 1)
+    const fit = meta.isBackground ? 'fill' : normalizeImageFit(meta.fit ?? 'contain')
+    const targetWidth = meta.isBackground ? CARD_WIDTH : Math.max(1, meta.slotWidth ?? object.getScaledWidth?.() ?? object.width ?? 1)
+    const targetHeight = meta.isBackground ? CARD_HEIGHT : Math.max(1, meta.slotHeight ?? object.getScaledHeight?.() ?? object.height ?? 1)
 
     applyImageFit(object, fit, targetWidth, targetHeight, meta.cropPositionX, meta.cropPositionY)
     setLayerMeta(object, { ...meta, fit, slotWidth: targetWidth, slotHeight: targetHeight })
@@ -2463,6 +2492,36 @@ app.innerHTML = `
         <input id="printGapInput" type="number" min="0" max="30" step="1" value="3" />
       </label>
 
+      <fieldset class="print-cut-guide">
+        <legend>Linha auxiliar de corte</legend>
+        <label class="print-option-switch" for="printCutLineEnabled">
+          <span>
+            <span class="print-option-title">Mostrar linha de corte</span>
+            <span class="print-option-description">Desenha uma linha ao redor de cada carta marcando onde cortar.</span>
+          </span>
+          <input id="printCutLineEnabled" type="checkbox" role="switch" checked />
+          <span class="theme-switch-track" aria-hidden="true"><span class="theme-switch-thumb"></span></span>
+        </label>
+        <div id="printCutLineOptions" class="print-cut-guide-options">
+          <label>
+            Espessura (mm)
+            <input id="printCutLineWidth" type="number" min="0.1" max="2" step="0.1" value="0.2" />
+          </label>
+          <label>
+            Cor
+            <input id="printCutLineColor" type="color" value="#000000" />
+          </label>
+          <label>
+            Estilo
+            <select id="printCutLineStyle">
+              <option value="dotted" selected>Pontilhada</option>
+              <option value="dashed">Tracejada</option>
+              <option value="solid">Sólida</option>
+            </select>
+          </label>
+        </div>
+      </fieldset>
+
       <label class="print-option-switch" for="printIncludeBackSwitch">
         <span>
           <span class="print-option-title">Imprimir verso das cartas</span>
@@ -2537,6 +2596,19 @@ app.innerHTML = `
     </div>
   </section>
 </div>
+
+<div id="assetPickerModal" class="templates-modal" hidden>
+  <div id="assetPickerBackdrop" class="templates-modal-backdrop"></div>
+  <section class="templates-modal-dialog asset-picker-dialog" role="dialog" aria-modal="true" aria-labelledby="assetPickerTitle">
+    <h2 id="assetPickerTitle">Substituir asset</h2>
+    <p class="layer-note">Duplo clique em um asset ou selecione e confirme.</p>
+    <div id="assetPickerList" class="variant-picker asset-picker-list"></div>
+    <div class="dialog-actions">
+      <button id="assetPickerCancel" class="ghost" type="button">Cancelar</button>
+      <button id="assetPickerConfirm" class="primary" type="button" disabled>Confirmar</button>
+    </div>
+  </section>
+</div>
 `
 
 function requireElement<T extends Element>(root: ParentNode, selector: string): T {
@@ -2579,6 +2651,11 @@ const confirmModalCancel = requireElement<HTMLButtonElement>(app, '#confirmModal
 const confirmModalAccept = requireElement<HTMLButtonElement>(app, '#confirmModalAccept')
 const newCardModal = requireElement<HTMLDivElement>(app, '#newCardModal')
 const newCardModalBackdrop = requireElement<HTMLDivElement>(app, '#newCardModalBackdrop')
+const assetPickerModal = requireElement<HTMLDivElement>(app, '#assetPickerModal')
+const assetPickerBackdrop = requireElement<HTMLDivElement>(app, '#assetPickerBackdrop')
+const assetPickerList = requireElement<HTMLDivElement>(app, '#assetPickerList')
+const assetPickerCancel = requireElement<HTMLButtonElement>(app, '#assetPickerCancel')
+const assetPickerConfirm = requireElement<HTMLButtonElement>(app, '#assetPickerConfirm')
 const newCardModels = requireElement<HTMLDivElement>(app, '#newCardModels')
 const newCardBacks = requireElement<HTMLDivElement>(app, '#newCardBacks')
 const newCardCancel = requireElement<HTMLButtonElement>(app, '#newCardCancel')
@@ -2615,6 +2692,11 @@ const printPaperSizeSelect = requireElement<HTMLSelectElement>(app, '#printPaper
 const printOrientationSelect = requireElement<HTMLSelectElement>(app, '#printOrientationSelect')
 const printGapInput = requireElement<HTMLInputElement>(app, '#printGapInput')
 const printIncludeBackSwitch = requireElement<HTMLInputElement>(app, '#printIncludeBackSwitch')
+const printCutLineEnabled = requireElement<HTMLInputElement>(app, '#printCutLineEnabled')
+const printCutLineOptions = requireElement<HTMLDivElement>(app, '#printCutLineOptions')
+const printCutLineWidth = requireElement<HTMLInputElement>(app, '#printCutLineWidth')
+const printCutLineColor = requireElement<HTMLInputElement>(app, '#printCutLineColor')
+const printCutLineStyle = requireElement<HTMLSelectElement>(app, '#printCutLineStyle')
 const printLayoutSummary = requireElement<HTMLParagraphElement>(app, '#printLayoutSummary')
 const printPreviewSheet = requireElement<HTMLDivElement>(app, '#printPreviewSheet')
 const printPreviewGrid = requireElement<HTMLDivElement>(app, '#printPreviewGrid')
@@ -3130,6 +3212,22 @@ function createArrangeControls(): HTMLElement {
 
   const fill = (horizontal: boolean, vertical: boolean): void => apply((objects) => {
     objects.forEach((object) => {
+      if (object instanceof Textbox && getLayerMeta(object).kind === 'text' && (object.angle ?? 0) === 0) {
+        // Texto: redimensiona a caixa em vez de deformar as letras.
+        const sx = object.scaleX || 1
+        const sy = object.scaleY || 1
+        if (horizontal) object.set({ width: CARD_WIDTH / sx })
+        if (vertical) setLayerMeta(object, { ...getLayerMeta(object), textBoxHeight: CARD_HEIGHT / sy })
+        object.initDimensions()
+        object.setCoords()
+        const box = object.getBoundingRect()
+        shift(
+          object,
+          horizontal ? CARD_WIDTH / 2 - (box.left + box.width / 2) : 0,
+          vertical ? CARD_HEIGHT / 2 - (box.top + box.height / 2) : 0,
+        )
+        return
+      }
       const r = object.getBoundingRect()
       if (horizontal && r.width >= 1) {
         object.set({ scaleX: (object.scaleX ?? 1) * (CARD_WIDTH / r.width) })
@@ -3298,17 +3396,6 @@ function renderRichTextEditor(
   colorInput.value = '#2f9e44'
   attachNoDragPropagation(colorInput)
 
-  const selectedFontFamily = createFontSelect(String((textObject as { fontFamily?: unknown }).fontFamily ?? 'Arial'))
-  attachNoDragPropagation(selectedFontFamily)
-  const selectedFontSize = document.createElement('input')
-  selectedFontSize.type = 'number'
-  selectedFontSize.min = '8'
-  selectedFontSize.max = '220'
-  selectedFontSize.step = '1'
-  selectedFontSize.value = String((textObject as { fontSize?: unknown }).fontSize ?? 40)
-  selectedFontSize.title = 'Tamanho para o trecho selecionado'
-  attachNoDragPropagation(selectedFontSize)
-
   const applyColorButton = createEditorToolbarButton('Cor', () => {
     selectedTextEditor?.chain().focus().setColor(colorInput.value).run()
   })
@@ -3327,13 +3414,6 @@ function renderRichTextEditor(
   const clearMarksButton = createEditorToolbarButton('Limpar estilo', () => {
     selectedTextEditor?.chain().focus().unsetAllMarks().run()
   })
-  const applySelectedFontButton = createEditorToolbarButton('Aplicar fonte', () => {
-    selectedTextEditor?.chain().focus().setMark('textStyle', { fontFamily: selectedFontFamily.value }).run()
-  })
-  const applySelectedSizeButton = createEditorToolbarButton('Aplicar tamanho', () => {
-    const fontSize = clamp(8, 220, Number(selectedFontSize.value) || 40)
-    selectedTextEditor?.chain().focus().setMark('textStyle', { fontSize: `${fontSize}px` }).run()
-  })
 
   toolbar.append(
     boldButton,
@@ -3341,10 +3421,6 @@ function renderRichTextEditor(
     underlineButton,
     colorInput,
     applyColorButton,
-    selectedFontFamily,
-    applySelectedFontButton,
-    selectedFontSize,
-    applySelectedSizeButton,
     clearColorButton,
     clearMarksButton,
   )
@@ -3386,9 +3462,30 @@ function renderRichTextEditor(
       const html = editor.getHTML()
       applyRichTextToObject(textObject, html, 'html')
       textObject.setCoords()
+      container.dispatchEvent(new CustomEvent('rich-text-sync'))
       commit()
     },
   })
+
+  const baseFontFamily = String((textObject as { fontFamily?: unknown }).fontFamily ?? 'Arial')
+  editorElement.style.fontFamily = baseFontFamily
+  const toggles: Array<[HTMLButtonElement, string]> = [[boldButton, 'bold'], [italicButton, 'italic'], [underlineButton, 'underline']]
+  const syncToggles = (): void => {
+    const editor = selectedTextEditor
+    if (editor) toggles.forEach(([button, name]) => button.classList.toggle('is-active', editor.isActive(name)))
+  }
+  // Blur dispara transaction; por isso a cor só sincroniza quando a seleção muda.
+  const syncToolbar = (): void => {
+    const editor = selectedTextEditor
+    if (!editor) return
+    syncToggles()
+    const attrs = editor.getAttributes('textStyle') as Record<string, string | null>
+    const color = attrs['color']
+    if (color && /^#[0-9a-fA-F]{6}$/.test(color)) colorInput.value = color
+  }
+  selectedTextEditor.on('selectionUpdate', syncToolbar)
+  selectedTextEditor.on('transaction', syncToggles)
+  syncToolbar()
 }
 
 function removeLegacyTaggedTextControls(container: HTMLElement): void {
@@ -3444,6 +3541,7 @@ function renderSelectedTextEditor(textObject: FabricText | Textbox): void {
   })
   editPanelContent.append(detailsRow('Tamanho base', fontSizeField))
   editPanelContent.append(createTextLayoutControls(textObject, commitDeckContentChanges))
+  editPanelContent.append(createArrangeControls())
 }
 
 function createGraphicSizeControls(graphic: FabricObject): DocumentFragment {
@@ -3697,20 +3795,12 @@ function createGraphicReplaceControls(graphic: FabricObject): DocumentFragment {
     }).then(() => { if (canvas.getActiveObject() === graphic) renderSelectedItemEditor() })
   }
 
-  const select = document.createElement('select')
-  select.innerHTML = '<option value="">Trocar por asset…</option>'
-  currentDeck().library.forEach((asset) => {
-    const option = document.createElement('option')
-    option.value = asset.id
-    option.textContent = asset.name
-    select.append(option)
-  })
-  attachNoDragPropagation(select)
-  select.addEventListener('change', () => {
-    const asset = currentDeck().library.find((item) => item.id === select.value)
-    if (asset) run(asset.src, asset.name)
-    select.value = ''
-  })
+  const assetButton = document.createElement('button')
+  assetButton.type = 'button'
+  assetButton.className = 'ghost tiny'
+  assetButton.textContent = 'Trocar por asset…'
+  attachNoDragPropagation(assetButton)
+  assetButton.addEventListener('click', () => { void chooseAssetForGraphic(graphic) })
 
   const fileInput = document.createElement('input')
   fileInput.type = 'file'
@@ -3728,8 +3818,35 @@ function createGraphicReplaceControls(graphic: FabricObject): DocumentFragment {
   attachNoDragPropagation(fileButton)
   fileButton.addEventListener('click', () => fileInput.click())
 
-  fragment.append(detailsRow('Substituir asset', select), fileButton, fileInput)
+  fragment.append(assetButton, fileButton, fileInput)
   return fragment
+}
+
+async function chooseAssetForGraphic(graphic: FabricImage): Promise<void> {
+  const asset = await pickLibraryAsset()
+  if (!asset) return
+  await withLoading(async () => {
+    try {
+      await replaceGraphicSource(graphic, asset.src, asset.name)
+    } catch {
+      window.alert('Falha ao substituir o asset.')
+    }
+  })
+  if (canvas.getActiveObject() === graphic) renderSelectedItemEditor()
+}
+
+async function chooseAssetForIllustration(object: FabricImage): Promise<void> {
+  const asset = await pickLibraryAsset()
+  if (!asset) return
+  try {
+    const fit = normalizeImageFit(getLayerMeta(object).fit ?? 'contain', 'contain')
+    await replaceIllustrationOnObject(object, asset.src, fit)
+    canvas.requestRenderAll()
+    persistActiveDeckDocument()
+    renderCardThumbnails()
+  } catch {
+    window.alert('Falha ao substituir a ilustracao desta carta.')
+  }
 }
 
 function renderSelectedGraphicEditor(graphic: FabricObject): void {
@@ -3786,6 +3903,16 @@ function renderSelectedImageEditor(imageObject: FabricImage): void {
   note.textContent = 'Troque a ilustração apenas desta carta.'
   editPanelContent.append(note)
   editPanelContent.append(createImageBehaviorControls(imageObject))
+  const meta = getLayerMeta(imageObject)
+  if (!meta.locked && !meta.isBackground) {
+    const assetButton = document.createElement('button')
+    assetButton.type = 'button'
+    assetButton.className = 'ghost tiny'
+    assetButton.textContent = 'Trocar por asset…'
+    attachNoDragPropagation(assetButton)
+    assetButton.addEventListener('click', () => { void chooseAssetForIllustration(imageObject) })
+    editPanelContent.append(assetButton)
+  }
 }
 
 function renderSelectedItemEditor(): void {
@@ -4160,9 +4287,9 @@ async function loadDeckCanvas(state: ReturnType<Canvas['toObject']>): Promise<vo
         }
 
         // use saved slot dimensions – never recalculate from natural image size
-        const fit = normalizeImageFit(meta.fit ?? 'contain')
-        const targetWidth = Math.max(1, meta.slotWidth ?? object.getScaledWidth?.() ?? object.width ?? 1)
-        const targetHeight = Math.max(1, meta.slotHeight ?? object.getScaledHeight?.() ?? object.height ?? 1)
+        const fit = meta.isBackground ? 'fill' : normalizeImageFit(meta.fit ?? 'contain')
+        const targetWidth = meta.isBackground ? CARD_WIDTH : Math.max(1, meta.slotWidth ?? object.getScaledWidth?.() ?? object.width ?? 1)
+        const targetHeight = meta.isBackground ? CARD_HEIGHT : Math.max(1, meta.slotHeight ?? object.getScaledHeight?.() ?? object.height ?? 1)
 
         applyImageFit(object, fit, targetWidth, targetHeight, meta.cropPositionX, meta.cropPositionY)
         setLayerMeta(object, { ...meta, fit, slotWidth: targetWidth, slotHeight: targetHeight })
@@ -4899,6 +5026,7 @@ function buildLayerBody(object: FabricObject, meta: LayerMeta, editable: boolean
             commitCardTextChanges()
           })
           body.append(detailsRow('Texto da carta (com tags)', textField))
+          body.addEventListener('rich-text-sync', () => { textField.value = textObjectToTagMarkup(textObject) })
 
           const tagSyntaxField = document.createElement('select')
           attachNoDragPropagation(tagSyntaxField)
@@ -5239,6 +5367,7 @@ function buildLayerBody(object: FabricObject, meta: LayerMeta, editable: boolean
         canvas.requestRenderAll()
       })
       body.append(detailsRow('Texto (com cores por trecho)', textField))
+      body.addEventListener('rich-text-sync', () => { textField.value = textObjectToTagMarkup(textObject) })
 
       const textPalette = document.createElement('div')
       textPalette.className = 'text-color-palette'
@@ -5365,21 +5494,6 @@ function buildLayerBody(object: FabricObject, meta: LayerMeta, editable: boolean
       textStyleControls.className = 'text-style-controls'
       ;[
         {
-          label: 'Negrito',
-          checked: String((textObject as any).fontWeight ?? '').toLowerCase() === 'bold' || Number((textObject as any).fontWeight) >= 600,
-          apply: (enabled: boolean) => textObject.set({ fontWeight: enabled ? 'bold' : 'normal' }),
-        },
-        {
-          label: 'Itálico',
-          checked: String((textObject as any).fontStyle ?? '').toLowerCase() === 'italic',
-          apply: (enabled: boolean) => textObject.set({ fontStyle: enabled ? 'italic' : 'normal' }),
-        },
-        {
-          label: 'Sublinhado',
-          checked: Boolean((textObject as any).underline),
-          apply: (enabled: boolean) => textObject.set({ underline: enabled }),
-        },
-        {
           label: 'Tachado',
           checked: Boolean((textObject as any).linethrough),
           apply: (enabled: boolean) => textObject.set({ linethrough: enabled }),
@@ -5402,7 +5516,7 @@ function buildLayerBody(object: FabricObject, meta: LayerMeta, editable: boolean
         label.append(field, caption)
         textStyleControls.append(label)
       })
-      body.append(detailsRow('Estilo padrão', textStyleControls))
+      body.append(detailsRow('Estilo do texto', textStyleControls))
 
       const rawShadow = (textObject as any).shadow as
         | { color?: string; blur?: number; offsetX?: number; offsetY?: number }
@@ -6361,6 +6475,60 @@ function openConfirm(
   })
 }
 
+function pickLibraryAsset(): Promise<LibraryAsset | null> {
+  return new Promise((resolve) => {
+    const assets = currentDeck().library
+    let selected: LibraryAsset | null = null
+    assetPickerList.innerHTML = ''
+    assetPickerConfirm.disabled = true
+    if (assets.length === 0) {
+      const empty = document.createElement('p')
+      empty.className = 'layer-note'
+      empty.textContent = 'Nenhum asset disponível na biblioteca.'
+      assetPickerList.append(empty)
+    }
+    const buttons: HTMLButtonElement[] = []
+    const finish = (asset: LibraryAsset | null): void => {
+      assetPickerModal.hidden = true
+      assetPickerConfirm.removeEventListener('click', onConfirm)
+      assetPickerCancel.removeEventListener('click', onCancel)
+      assetPickerBackdrop.removeEventListener('click', onCancel)
+      window.removeEventListener('keydown', onKey)
+      resolve(asset)
+    }
+    const onConfirm = (): void => finish(selected)
+    const onCancel = (): void => finish(null)
+    const onKey = (event: KeyboardEvent): void => {
+      if (event.key === 'Escape') finish(null)
+    }
+    assets.forEach((asset) => {
+      const button = document.createElement('button')
+      button.type = 'button'
+      button.className = 'variant-option asset-picker-item'
+      const img = document.createElement('img')
+      img.src = asset.src
+      img.alt = asset.name
+      const label = document.createElement('span')
+      label.textContent = asset.name
+      button.append(img, label)
+      button.addEventListener('click', () => {
+        selected = asset
+        buttons.forEach((item) => item.classList.toggle('is-active', item === button))
+        assetPickerConfirm.disabled = false
+      })
+      button.addEventListener('dblclick', () => finish(asset))
+      buttons.push(button)
+      assetPickerList.append(button)
+    })
+    assetPickerConfirm.addEventListener('click', onConfirm)
+    assetPickerCancel.addEventListener('click', onCancel)
+    assetPickerBackdrop.addEventListener('click', onCancel)
+    window.addEventListener('keydown', onKey)
+    assetPickerModal.hidden = false
+    assetPickerCancel.focus()
+  })
+}
+
 async function confirmDialog(title: string, message: string, acceptLabel: string): Promise<boolean> {
   return (await openConfirm(title, message, acceptLabel)).ok
 }
@@ -6851,6 +7019,20 @@ async function captureDeckBackPrintImage(back: CardBack): Promise<string> {
   return thumbnailCanvas.toDataURL({ format: 'png', multiplier: 1 })
 }
 
+function drawCutGuide(context: CanvasRenderingContext2D, x: number, y: number, width: number, height: number): void {
+  const lineWidth = Math.max(1, mmToPx(clamp(0.1, 2, Number(printCutLineWidth.value) || 0.2)))
+  const style = printCutLineStyle.value
+  context.save()
+  context.strokeStyle = printCutLineColor.value
+  context.lineWidth = lineWidth
+  context.lineCap = style === 'dotted' ? 'round' : 'butt'
+  context.setLineDash(style === 'dotted' ? [0, lineWidth * 2.5] : style === 'dashed' ? [lineWidth * 5, lineWidth * 3] : [])
+  // A linha fica fora da carta para não cobrir a arte.
+  const offset = lineWidth / 2
+  context.strokeRect(x - offset, y - offset, width + lineWidth, height + lineWidth)
+  context.restore()
+}
+
 async function generateDeckPrintSheets(downloadFormat: 'zip' | 'pdf'): Promise<void> {
   return withLoading(async () => {
     const deck = currentDeck()
@@ -6931,6 +7113,7 @@ async function generateDeckPrintSheets(downloadFormat: 'zip' | 'pdf'): Promise<v
             const printImage = side === 'verso' ? backImages.get(deck.cards[cardIndex].backId) : imageElements[cardIndex]
             if (!printImage) throw new Error('Falha ao preparar o verso para impressao.')
             context.drawImage(printImage, x, y, cardWidthPx, cardHeightPx)
+            if (printCutLineEnabled.checked) drawCutGuide(context, x, y, cardWidthPx, cardHeightPx)
           }
 
           if (downloadFormat === 'zip' && zip) {
@@ -6996,6 +7179,9 @@ function updatePrintPreview(): void {
     thumb.className = 'print-preview-card'
     thumb.style.width = `${cardWidthPx}px`
     thumb.style.height = `${cardHeightPx}px`
+    if (printCutLineEnabled.checked) {
+      thumb.style.outline = `${Math.max(1, Math.round(clamp(0.1, 2, Number(printCutLineWidth.value) || 0.2) * mmScale))}px ${printCutLineStyle.value} ${printCutLineColor.value}`
+    }
     const caption = document.createElement('span')
     caption.textContent = String(i + 1)
     thumb.append(caption)
@@ -7442,6 +7628,13 @@ printPaperSizeSelect.addEventListener('change', updatePrintPreview)
 printOrientationSelect.addEventListener('change', updatePrintPreview)
 printGapInput.addEventListener('input', updatePrintPreview)
 printIncludeBackSwitch.addEventListener('change', updatePrintPreview)
+printCutLineEnabled.addEventListener('change', () => {
+  printCutLineOptions.hidden = !printCutLineEnabled.checked
+  updatePrintPreview()
+})
+printCutLineWidth.addEventListener('input', updatePrintPreview)
+printCutLineColor.addEventListener('input', updatePrintPreview)
+printCutLineStyle.addEventListener('change', updatePrintPreview)
 generateDeckPrintZipButton.addEventListener('click', () => {
   void generateDeckPrintSheets('zip')
 })
@@ -7466,6 +7659,14 @@ window.addEventListener('keydown', (event) => {
 })
 
 canvas.upperCanvasEl.addEventListener('dblclick', () => {
+  const active = canvas.getActiveObject()
+  if (active instanceof FabricImage) {
+    const meta = getLayerMeta(active)
+    if (meta.kind === 'graphic') {
+      if (meta.scope === activeEditMode && !meta.locked && !meta.isBackground) void chooseAssetForGraphic(active)
+      return
+    }
+  }
   openIllustrationUpload()
 })
 
