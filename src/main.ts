@@ -6415,6 +6415,7 @@ function createCard(modelId: string, backId: string): void {
   deck.activeCardId = newCard.id
   void loadActiveDeckCard(deck, newCard.id).then(async () => {
     await refreshDeckThumbnails(deck)
+    cardThumbnails.scrollTop = cardThumbnails.scrollHeight
   })
   renderWorkspaceTabs()
 }
@@ -7358,32 +7359,7 @@ importDeckButton.addEventListener('click', () => {
   importDeckInput.click()
 })
 
-interface PresetDeckEntry { name: string; file: string; description?: string; cover?: string }
-
-const presetCoverCache = new Map<string, Promise<string>>()
-
-function fetchPresetCover(file: string): Promise<string> {
-  let cached = presetCoverCache.get(file)
-  if (!cached) {
-    cached = (async () => {
-      const res = await fetch(presetDeckUrl(file))
-      if (!res.ok) return ''
-      const parsed = JSON.parse(await decompressDeckText(new File([await res.blob()], file))) as Record<string, unknown>
-      const deck = (parsed['deck'] ?? parsed) as Record<string, unknown>
-      if (typeof deck['cover'] === 'string' && deck['cover']) return deck['cover']
-      if (typeof parsed['cover'] === 'string' && parsed['cover']) return parsed['cover']
-      const backs = Array.isArray(deck['backs']) ? deck['backs'] as Array<Record<string, unknown>> : []
-      const activeBackId = typeof deck['activeBackId'] === 'string' ? deck['activeBackId'] : ''
-      const activeBack = backs.find((back) => back['id'] === activeBackId)
-      const backThumbnail = activeBack?.['thumbnail'] || backs[0]?.['thumbnail']
-      if (typeof backThumbnail === 'string' && backThumbnail) return backThumbnail
-      const firstCard = Array.isArray(deck['cards']) ? deck['cards'][0] as Record<string, unknown> | undefined : undefined
-      return typeof firstCard?.['thumbnail'] === 'string' ? firstCard['thumbnail'] : ''
-    })().catch(() => '')
-    presetCoverCache.set(file, cached)
-  }
-  return cached
-}
+interface PresetDeckEntry { name?: string; image?: string; url: string }
 
 deckCoverUploadButton.addEventListener('click', () => { deckCoverInput.click() })
 deckCoverInput.addEventListener('change', async () => {
@@ -7409,8 +7385,9 @@ coverSwitchButtons.forEach((button) => {
 })
 applyDeckCover()
 
-function presetDeckUrl(file: string): string {
-  return `${import.meta.env.BASE_URL}decks/${encodeURIComponent(file)}`
+// URLs absolutas (hospedagem externa) passam direto; relativas partem de BASE_URL.
+function resolvePresetUrl(url: string): string {
+  return /^https?:\/\//i.test(url) ? url : `${import.meta.env.BASE_URL}${url.replace(/^\/+/, '')}`
 }
 
 async function loadPresetDecks(): Promise<void> {
@@ -7427,54 +7404,31 @@ async function loadPresetDecks(): Promise<void> {
 
       const cover = document.createElement('div')
       cover.className = 'preset-deck-cover'
-      if (entry.cover) {
-        cover.style.backgroundImage = `url("${import.meta.env.BASE_URL}decks/${entry.cover.split('/').map(encodeURIComponent).join('/')}")`
-      } else {
-        void fetchPresetCover(entry.file).then((src) => {
-          if (src) cover.style.backgroundImage = `url("${src}")`
-        })
+      if (entry.image) {
+        cover.style.backgroundImage = `url("${encodeURI(resolvePresetUrl(entry.image))}")`
       }
       li.append(cover)
 
       const info = document.createElement('div')
       info.className = 'preset-deck-info'
-      const title = document.createElement('strong')
-      title.textContent = entry.name
-      info.append(title)
-      if (entry.description) {
-        const desc = document.createElement('span')
-        desc.textContent = entry.description
-        info.append(desc)
+      if (entry.name) {
+        const title = document.createElement('strong')
+        title.textContent = entry.name
+        info.append(title)
       }
 
       const actions = document.createElement('div')
       actions.className = 'preset-deck-actions'
 
-      const editBtn = document.createElement('button')
-      editBtn.type = 'button'
-      editBtn.className = 'preset-deck-btn'
-      editBtn.textContent = 'Editar'
-      editBtn.addEventListener('click', () => {
-        void withLoading(async () => {
-          try {
-            const res = await fetch(presetDeckUrl(entry.file))
-            if (!res.ok) throw new Error('Não foi possível carregar o deck.')
-            const blob = await res.blob()
-            await importDeckFile(new File([blob], `${entry.name}.deck`))
-            presetDecksModal.hidden = true
-          } catch (error) {
-            window.alert(error instanceof Error ? error.message : 'Falha ao carregar deck.')
-          }
-        })
-      })
-
       const link = document.createElement('a')
       link.className = 'preset-deck-btn'
-      link.href = presetDeckUrl(entry.file)
-      link.download = `${entry.name}.deck`
+      link.href = resolvePresetUrl(entry.url)
+      link.download = `${entry.name ?? 'deck'}.deck`
+      link.target = '_blank'
+      link.rel = 'noopener noreferrer'
       link.textContent = 'Baixar'
 
-      actions.append(editBtn, link)
+      actions.append(link)
       li.append(info, actions)
       presetDeckList.append(li)
     }
