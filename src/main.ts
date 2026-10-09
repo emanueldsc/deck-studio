@@ -3608,7 +3608,7 @@ function createGraphicPositionControls(graphic: FabricObject): DocumentFragment 
 
 async function duplicateGraphic(graphic: FabricObject, offset: number): Promise<FabricObject | null> {
   const meta = getLayerMeta(graphic)
-  if (meta.kind !== 'graphic' || meta.scope !== activeEditMode || meta.locked || meta.isBackground) return null
+  if ((meta.kind !== 'graphic' && meta.kind !== 'text') || meta.scope !== activeEditMode || meta.locked || meta.isBackground) return null
   const copy = await graphic.clone()
   setLayerMeta(copy, { ...deepClone(meta), id: generateLayerId() })
   copy.set({ left: (graphic.left ?? 0) + offset, top: (graphic.top ?? 0) + offset })
@@ -7129,6 +7129,15 @@ async function generateDeckPrintSheets(downloadFormat: 'zip' | 'pdf'): Promise<v
         }
       }
 
+      const creditsCanvas = createCreditsSheet(paperWidthPx, paperHeightPx)
+      if (creditsCanvas) {
+        if (zip) zip.file(`${baseName}-creditos.png`, await canvasToBlob(creditsCanvas))
+        if (pdf) {
+          pdf.addPage()
+          pdf.addImage(creditsCanvas.toDataURL('image/png'), 'PNG', 0, 0, layout.paper.widthMm, layout.paper.heightMm, undefined, 'FAST')
+        }
+      }
+
       if (downloadFormat === 'zip' && zip) {
         const zipBlob = await zip.generateAsync({
           type: 'blob',
@@ -7153,6 +7162,36 @@ async function generateDeckPrintSheets(downloadFormat: 'zip' | 'pdf'): Promise<v
       generateDeckPrintZipButton.textContent = previousZipText
     }
   })
+}
+
+function createCreditsSheet(width: number, height: number): HTMLCanvasElement | null {
+  const url = String(import.meta.env.VITE_CREDITS_SITE_URL ?? '').trim()
+  const author = String(import.meta.env.VITE_CREDITS_AUTHOR ?? '').trim()
+  const phrase = String(import.meta.env.VITE_CREDITS_PHRASE ?? '').trim()
+  const lines = [phrase, author, url].filter(Boolean)
+  if (lines.length === 0) return null
+
+  const sheet = document.createElement('canvas')
+  sheet.width = width
+  sheet.height = height
+  const ctx = sheet.getContext('2d')
+  if (!ctx) return null
+  ctx.fillStyle = '#ffffff'
+  ctx.fillRect(0, 0, width, height)
+  ctx.fillStyle = '#1c2738'
+  ctx.textAlign = 'center'
+  ctx.textBaseline = 'middle'
+
+  const unit = Math.round(width / 40)
+  const sizes = [unit * 1.4, unit * 1.1, unit]
+  const offset = 3 - lines.length
+  const lineGap = unit * 2.2
+  const startY = height / 2 - ((lines.length - 1) * lineGap) / 2
+  lines.forEach((text, index) => {
+    ctx.font = `${sizes[index + offset]}px Arial, sans-serif`
+    ctx.fillText(text, width / 2, startY + index * lineGap, width * 0.85)
+  })
+  return sheet
 }
 
 function updatePrintPreview(): void {
